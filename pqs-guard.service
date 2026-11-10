@@ -1,0 +1,15 @@
+[Unit]
+Description=PQS IP guard + Telegram bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/pqs-guard/config.env
+ExecStart=/opt/pqs-guard/venv/bin/python /opt/pqs-guard/pqs_guard.py
+Restart=always
+RestartSec=10
+StateDirectory=pqs-guard
+
+[Install]
+WantedBy=multi-user.target
