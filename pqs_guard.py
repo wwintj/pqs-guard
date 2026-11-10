@@ -34,7 +34,7 @@ from urllib.parse import urlparse
 
 import httpx
 
-__version__ = "1.2.1"
+__version__ = "1.2.2"
 
 log = logging.getLogger("pqs-guard")
 
@@ -172,9 +172,20 @@ class State:
         except Exception as e:
             log.error("保存状态失败: %s", e)
 
-    def today_count(self):
+    @staticmethod
+    def is_manual(h):
+        # 旧记录没有 manual 字段，按原因判断
+        return h.get("manual", h.get("reason") == "手动更换")
+
+    def today_count(self, kind="all"):
+        """kind: all / auto / manual"""
         today = dt.date.today().isoformat()
-        return sum(1 for h in self.history if h["t"].startswith(today))
+        hs = [h for h in self.history if h["t"].startswith(today)]
+        if kind == "auto":
+            hs = [h for h in hs if not self.is_manual(h)]
+        elif kind == "manual":
+            hs = [h for h in hs if self.is_manual(h)]
+        return len(hs)
 
 
 ST = None  # type: State
@@ -344,7 +355,8 @@ def fmt_report(r, ts=None):
         f"🎬 <b>Netflix</b>　{html.escape(_nf_text(n))}",
         f"🔗 <b>DDNS</b>　{html.escape(_ddns_text())}",
         "",
-        f"🤖 自动换 IP <b>{'开' if ST.auto else '关'}</b> · 今日 {ST.today_count()}/{CFG.max_per_day}",
+        f"🤖 自动换 IP <b>{'开' if ST.auto else '关'}</b> · 今日自动 {ST.today_count('auto')}/{CFG.max_per_day}"
+        f" · 手动 {ST.today_count('manual')}",
         f"<i>⏱ 每 {CFG.interval // 60} 分钟检测 · 上次 {when}</i>",
     ])
 
@@ -496,7 +508,7 @@ async def change_ip(app, reason, manual=False):
             if wait > 0:
                 log.info("冷却中，%ds 后才能自动换 IP", wait)
                 return
-            if ST.today_count() >= CFG.max_per_day:
+            if ST.today_count("auto") >= CFG.max_per_day:
                 log.warning("今日自动换 IP 已达上限")
                 return
 
@@ -517,7 +529,7 @@ async def change_ip(app, reason, manual=False):
         log.info("PQS API: %s", api_resp)
 
         entry = {"t": dt.datetime.now().isoformat(timespec="seconds"), "reason": reason,
-                 "old": old_ip, "new": None, "ok": False}
+                 "manual": manual, "old": old_ip, "new": None, "ok": False}
         ST.last_change = time.time()
         ST.history.append(entry)
         ST.save()
@@ -588,7 +600,7 @@ async def monitor_loop(app):
                     await notify(app, f"⚠️ 检测异常但自动换 IP 已关闭\n{html.escape(reason)}\n\n"
                                       f"{fmt_report(r)}", markup=panel_kb())
                     fails = {"gfw": 0, "nf": 0}  # 避免每轮都提醒
-                elif ST.today_count() >= CFG.max_per_day:
+                elif ST.today_count("auto") >= CFG.max_per_day:
                     today = dt.date.today().isoformat()
                     if limit_warned != today:
                         limit_warned = today
@@ -672,7 +684,7 @@ SETTINGS_TEXT = (
     "• <b>Netflix 要求</b>：全解锁 = 必须能看非自制剧；仅自制剧 = 能看自制剧就行\n"
     "• <b>检测间隔</b>：多久自动检测一次\n"
     "• <b>连续失败</b>：连续几次异常才换 IP，防误判\n"
-    "• <b>每日自动上限</b>：每天最多自动换几次（手动不受限）"
+    "• <b>每日自动上限</b>：每天最多自动换几次。手动换 IP 单独计数，不受限制"
 )
 
 HELP_TEXT = (
@@ -693,9 +705,11 @@ def history_text():
     rows = ["<b>📜 最近 10 次换 IP</b>", ""]
     for h in ST.history[-10:][::-1]:
         mark = "✅" if h["ok"] else "❌"
-        rows.append(f"{mark} <b>{h['t'][5:16].replace('T', ' ')}</b>　{html.escape(h['reason'])}\n"
+        kind = "🖐 手动" if ST.is_manual(h) else "🤖 自动"
+        reason = "" if ST.is_manual(h) else "　" + html.escape(h["reason"])
+        rows.append(f"{mark} <b>{h['t'][5:16].replace('T', ' ')}</b>　{kind}{reason}\n"
                     f"　　<code>{h['old']}</code> → <code>{h['new'] or '-'}</code>")
-    rows.append(f"\n今日共 {ST.today_count()} 次")
+    rows.append(f"\n今日：🤖 自动 {ST.today_count('auto')}/{CFG.max_per_day} 次 · 🖐 手动 {ST.today_count('manual')} 次（不限）")
     return "\n".join(rows)
 
 
