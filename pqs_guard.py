@@ -32,7 +32,7 @@ from urllib.parse import urlparse
 
 import httpx
 
-__version__ = "1.0.2"
+__version__ = "1.1.0"
 
 log = logging.getLogger("pqs-guard")
 
@@ -131,6 +131,9 @@ CFG = None  # type: Config
 
 # ───────────────────────────── 状态持久化 ─────────────────────────────
 
+TUNABLE = ("check_gfw", "check_netflix", "nf_require", "interval", "fail_threshold", "max_per_day")
+
+
 class State:
     def __init__(self, path, auto_default):
         self.path = path
@@ -144,13 +147,25 @@ class State:
         self.auto = data.get("auto", auto_default)
         self.last_change = data.get("last_change", 0.0)
         self.history = data.get("history", [])  # [{t, reason, old, new, ok}]
+        self.settings = {k: v for k, v in data.get("settings", {}).items() if k in TUNABLE}
+
+    def apply_settings(self):
+        """Telegram 里改过的设置覆盖配置文件里的值"""
+        for k, v in self.settings.items():
+            setattr(CFG, k, v)
+
+    def set(self, key, value):
+        self.settings[key] = value
+        setattr(CFG, key, value)
+        self.save()
 
     def save(self):
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             tmp = self.path.with_suffix(".tmp")
             tmp.write_text(json.dumps({"auto": self.auto, "last_change": self.last_change,
-                                       "history": self.history[-100:]}, ensure_ascii=False, indent=1))
+                                       "settings": self.settings, "history": self.history[-100:]},
+                                      ensure_ascii=False, indent=1))
             tmp.replace(self.path)
         except Exception as e:
             log.error("保存状态失败: %s", e)
@@ -162,6 +177,8 @@ class State:
 
 ST = None  # type: State
 CHANGE_LOCK = None  # 在事件循环内创建（兼容 Python 3.9）
+WAKE = None  # 设置变更时唤醒监控循环
+LAST = None  # 最近一次检测结果 {"r": ..., "t": timestamp}
 
 
 # ───────────────────────────── 网络检测 ─────────────────────────────
@@ -259,34 +276,75 @@ async def check_netflix():
         state, detail = "unknown", f"检测失败（自制剧 {oc}，非自制剧 {lc}），不判定"
     ok = None if state == "unknown" else (
         state == "full" if CFG.nf_require == "full" else state in ("full", "originals"))
-    return {"state": state, "ok": ok, "detail": detail}
+    return {"state": state, "ok": ok, "detail": detail, "region": region}
 
 
 async def run_checks():
+    global LAST
     ip, gfw, nf = await asyncio.gather(
         get_public_ip(),
         check_gfw() if CFG.check_gfw else _skip(),
         check_netflix() if CFG.check_netflix else _skip(),
     )
-    return {"ip": ip, "gfw": gfw, "nf": nf}
+    r = {"ip": ip, "gfw": gfw, "nf": nf}
+    LAST = {"r": r, "t": time.time()}
+    return r
 
 
 async def _skip():
     return {"state": "skip", "ok": None, "detail": "未启用"}
 
 
-def fmt_report(r):
+def _gfw_text(g):
+    cn = g.get("cn") or {}
+    reach = f" · 国内 {sum(cn.values())}/{len(cn)} 可达" if cn else ""
+    return {"ok": "✅ 正常", "blocked": "🚫 被墙", "unknown": "❔ 无法判断",
+            "skip": "➖ 未启用"}[g["state"]] + reach
+
+
+def _nf_text(n):
+    st, region = n["state"], n.get("region", "")
+    if st == "skip":
+        return "➖ 未启用"
+    if st == "full":
+        return f"✅ 全解锁 · {region}"
+    if st == "originals":
+        return ("✅" if n.get("ok") else "⚠️") + f" 仅自制剧 · {region}"
+    if st == "none":
+        return "❌ " + n["detail"]
+    return "❔ 检测失败"
+
+
+def _ddns_text():
+    if CFG.ddns_mode == "cloudflare":
+        return CFG.cf_record
+    if CFG.ddns_mode == "url":
+        return "自定义 URL"
+    return "未配置"
+
+
+def fmt_report(r, ts=None):
     g, n = r["gfw"], r["nf"]
-    gi = {"ok": "✅", "blocked": "🚫", "unknown": "❔", "skip": "➖"}[g["state"]]
-    ni = "➖" if n["state"] == "skip" else {True: "✅", False: "❌", None: "❔"}[n.get("ok")]
-    lines = [
-        f"🖥 <b>{html.escape(CFG.server_name)}</b>",
-        f"IP: <code>{r['ip'] or '获取失败'}</code>",
-        f"{gi} 墙: {html.escape(g['detail'])}",
-        f"{ni} Netflix: {html.escape(n['detail'])}",
-        f"🤖 自动换 IP: {'开' if ST.auto else '关'}　今日已换 {ST.today_count()}/{CFG.max_per_day}",
-    ]
-    return "\n".join(lines)
+    if g["state"] == "blocked":
+        head = "🔴 IP 被墙"
+    elif n.get("ok") is False:
+        head = "🟡 Netflix 不达标"
+    elif g["state"] == "unknown" or (n["state"] == "unknown"):
+        head = "⚪ 部分检测失败"
+    else:
+        head = "🟢 一切正常"
+    when = dt.datetime.fromtimestamp(ts or time.time()).strftime("%H:%M:%S")
+    return "\n".join([
+        f"<b>🖥 {html.escape(CFG.server_name)}</b>　{head}",
+        "",
+        f"🌐 <b>IP</b>　<code>{r['ip'] or '获取失败'}</code>",
+        f"🧱 <b>墙</b>　{_gfw_text(g)}",
+        f"🎬 <b>Netflix</b>　{html.escape(_nf_text(n))}",
+        f"🔗 <b>DDNS</b>　{html.escape(_ddns_text())}",
+        "",
+        f"🤖 自动换 IP <b>{'开' if ST.auto else '关'}</b> · 今日 {ST.today_count()}/{CFG.max_per_day}",
+        f"<i>⏱ 每 {CFG.interval // 60} 分钟检测 · 上次 {when}</i>",
+    ])
 
 
 # ───────────────────────────── DDNS ─────────────────────────────
@@ -373,7 +431,7 @@ async def change_ip(app, reason, manual=False):
         ST.save()
 
         if not api_ok:
-            await notify(app, f"❌ 换 IP 接口调用失败\n<code>{html.escape(api_resp)}</code>")
+            await notify(app, f"❌ 换 IP 接口调用失败\n<code>{html.escape(api_resp)}</code>", markup=panel_kb())
             return
 
         new_ip, deadline = None, time.time() + CFG.ip_wait
@@ -387,7 +445,7 @@ async def change_ip(app, reason, manual=False):
 
         if not new_ip:
             await notify(app, f"⚠️ 接口已调用，但 {CFG.ip_wait}s 内公网 IP 没变化\n"
-                              f"接口返回: <code>{html.escape(api_resp)}</code>")
+                              f"接口返回: <code>{html.escape(api_resp)}</code>", markup=panel_kb())
             return
 
         entry.update(new=new_ip, ok=True)
@@ -395,8 +453,8 @@ async def change_ip(app, reason, manual=False):
         ddns = await update_ddns(new_ip)
         await asyncio.sleep(5)
         report = await run_checks()
-        await notify(app, f"✅ 换 IP 完成\n<code>{old_ip}</code> → <code>{new_ip}</code>\n"
-                          f"DDNS: {html.escape(ddns)}\n\n{fmt_report(report)}")
+        await notify(app, f"✅ <b>换 IP 完成</b>\n<code>{old_ip}</code> → <code>{new_ip}</code>\n"
+                          f"DDNS：{html.escape(ddns)}\n\n{fmt_report(report)}", markup=panel_kb())
 
 
 # ───────────────────────────── 自动监控循环 ─────────────────────────────
@@ -428,46 +486,119 @@ async def monitor_loop(app):
             if reason:
                 if not ST.auto:
                     await notify(app, f"⚠️ 检测异常但自动换 IP 已关闭\n{html.escape(reason)}\n\n"
-                                      f"{fmt_report(r)}", markup=change_kb())
+                                      f"{fmt_report(r)}", markup=panel_kb())
                     fails = {"gfw": 0, "nf": 0}  # 避免每轮都提醒
                 elif ST.today_count() >= CFG.max_per_day:
                     today = dt.date.today().isoformat()
                     if limit_warned != today:
                         limit_warned = today
                         await notify(app, f"🛑 今日自动换 IP 已达上限 {CFG.max_per_day} 次，暂停自动更换\n"
-                                          f"{html.escape(reason)}", markup=change_kb())
+                                          f"{html.escape(reason)}", markup=panel_kb())
                 else:
                     await change_ip(app, reason)
                     fails = {"gfw": 0, "nf": 0}
         except Exception:
             log.exception("监控循环异常")
-        await asyncio.sleep(CFG.interval)
+        try:
+            await asyncio.wait_for(WAKE.wait(), CFG.interval)
+        except asyncio.TimeoutError:
+            pass
+        WAKE.clear()
 
 
 # ───────────────────────────── Telegram ─────────────────────────────
 
 from telegram import (BotCommand, InlineKeyboardButton, InlineKeyboardMarkup,  # noqa: E402
-                      Update)
+                      KeyboardButton, ReplyKeyboardMarkup, Update)
+from telegram.error import BadRequest  # noqa: E402
 from telegram.ext import (Application, CallbackQueryHandler, CommandHandler,  # noqa: E402
-                          ContextTypes)
+                          ContextTypes, MessageHandler, filters)
+
+B = InlineKeyboardButton
+PANEL_BTN = "🏠 控制面板"
+CYCLES = {
+    "interval": [180, 300, 600, 900, 1800],
+    "fail_threshold": [1, 2, 3, 5],
+    "max_per_day": [3, 5, 8, 12, 20],
+}
 
 
-def menu_kb():
+def _next(cur, opts):
+    return next((o for o in opts if o > cur), opts[0])
+
+
+def panel_kb():
+    auto = "🟢 自动换 IP：已开启" if ST.auto else "⚪️ 自动换 IP：已关闭"
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📊 状态检测", callback_data="status"),
-         InlineKeyboardButton("🔄 换 IP", callback_data="change")],
-        [InlineKeyboardButton(f"🤖 自动: {'开' if ST.auto else '关'}（点击切换）", callback_data="auto")],
-        [InlineKeyboardButton("📜 换 IP 记录", callback_data="history")],
+        [B("🔍 立即检测", callback_data="refresh"), B("🔄 更换 IP", callback_data="change")],
+        [B("🌐 同步 DDNS", callback_data="ddns"), B("📜 换 IP 记录", callback_data="history")],
+        [B(auto, callback_data="auto")],
+        [B("⚙️ 设置", callback_data="settings"), B("❓ 说明", callback_data="help")],
     ])
 
 
-def change_kb():
-    return InlineKeyboardMarkup([[InlineKeyboardButton("🔄 立即换 IP", callback_data="change")]])
+def back_kb():
+    return InlineKeyboardMarkup([[B("◀️ 返回面板", callback_data="home")]])
 
 
 def confirm_kb():
-    return InlineKeyboardMarkup([[InlineKeyboardButton("✅ 确认换 IP", callback_data="change_yes"),
-                                  InlineKeyboardButton("取消", callback_data="cancel")]])
+    return InlineKeyboardMarkup([[B("✅ 确认更换", callback_data="change_yes"),
+                                  B("✖️ 取消", callback_data="home")]])
+
+
+def settings_kb():
+    on = lambda b: "开" if b else "关"  # noqa: E731
+    return InlineKeyboardMarkup([
+        [B(f"🧱 被墙检测：{on(CFG.check_gfw)}", callback_data="s:check_gfw"),
+         B(f"🎬 Netflix 检测：{on(CFG.check_netflix)}", callback_data="s:check_netflix")],
+        [B(f"🎯 Netflix 要求：{'全解锁' if CFG.nf_require == 'full' else '仅自制剧'}",
+           callback_data="s:nf_require")],
+        [B(f"⏱ 检测间隔：{CFG.interval // 60} 分钟", callback_data="s:interval"),
+         B(f"🔁 连续失败：{CFG.fail_threshold} 次", callback_data="s:fail_threshold")],
+        [B(f"📅 每日自动上限：{CFG.max_per_day} 次", callback_data="s:max_per_day")],
+        [B("◀️ 返回面板", callback_data="home")],
+    ])
+
+
+def panel_text():
+    if LAST:
+        return fmt_report(LAST["r"], LAST["t"])
+    return (f"<b>🖥 {html.escape(CFG.server_name)}</b>\n\n还没有检测结果，点「🔍 立即检测」")
+
+
+SETTINGS_TEXT = (
+    "<b>⚙️ 设置</b>\n\n"
+    "点按钮即可切换，立即生效并永久保存。\n\n"
+    "• <b>被墙检测 / Netflix 检测</b>：关掉后不再因此自动换 IP\n"
+    "• <b>Netflix 要求</b>：全解锁 = 必须能看非自制剧；仅自制剧 = 能看自制剧就行\n"
+    "• <b>检测间隔</b>：多久自动检测一次\n"
+    "• <b>连续失败</b>：连续几次异常才换 IP，防误判\n"
+    "• <b>每日自动上限</b>：每天最多自动换几次（手动不受限）"
+)
+
+HELP_TEXT = (
+    "<b>❓ 说明</b>\n\n"
+    "🔍 <b>立即检测</b>：查看当前 IP、是否被墙、Netflix 解锁情况\n"
+    "🔄 <b>更换 IP</b>：手动换 IP，完成后自动同步 DDNS 并复检\n"
+    "🌐 <b>同步 DDNS</b>：把域名解析更新为当前 IP\n"
+    "📜 <b>换 IP 记录</b>：最近 10 次换 IP\n"
+    "🤖 <b>自动换 IP</b>：被墙或 Netflix 不达标时自动更换\n\n"
+    "<b>被墙判定</b>：国外能通，但国内目标全部连不上，且连续多次。"
+    "「国内 3/4 可达」表示 4 个国内目标连上 3 个，只要有 1 个能连就是正常。\n\n"
+    f"底部「{PANEL_BTN}」按钮随时打开本面板。"
+)
+
+
+def history_text():
+    if not ST.history:
+        return "<b>📜 换 IP 记录</b>\n\n暂无记录"
+    rows = ["<b>📜 最近 10 次换 IP</b>", ""]
+    for h in ST.history[-10:][::-1]:
+        mark = "✅" if h["ok"] else "❌"
+        rows.append(f"{mark} <b>{h['t'][5:16].replace('T', ' ')}</b>　{html.escape(h['reason'])}\n"
+                    f"　　<code>{h['old']}</code> → <code>{h['new'] or '-'}</code>")
+    rows.append(f"\n今日共 {ST.today_count()} 次")
+    return "\n".join(rows)
 
 
 def authorized(fn):
@@ -485,27 +616,61 @@ def authorized(fn):
     return wrapper
 
 
+async def safe_edit(q, text, kb=None):
+    try:
+        await q.edit_message_text(text, parse_mode="HTML", reply_markup=kb,
+                                  disable_web_page_preview=True)
+    except BadRequest as e:
+        if "not modified" not in str(e).lower():
+            raise
+
+
+async def send_panel(update: Update, refresh=False):
+    msg = update.effective_message
+    if refresh or not LAST:
+        m = await msg.reply_text("⏳ 正在检测，约 10-20 秒…")
+        await run_checks()
+        await m.edit_text(panel_text(), parse_mode="HTML", reply_markup=panel_kb())
+    else:
+        await msg.reply_text(panel_text(), parse_mode="HTML", reply_markup=panel_kb())
+
+
+async def do_ddns():
+    if CFG.ddns_mode == "none":
+        return "未配置 DDNS。\n如需配置，在服务器运行 <code>pqs-guard config</code>"
+    ip = await get_public_ip()
+    if not ip:
+        return "❌ 获取公网 IP 失败"
+    return "🌐 " + html.escape(await update_ddns(ip))
+
+
+# ── 命令 ──
+
 @authorized
 async def cmd_start(update: Update, ctx):
     await update.effective_message.reply_text(
-        f"🖥 <b>{html.escape(CFG.server_name)}</b> IP 管理\n\n"
-        "/status 检测状态（IP / 墙 / Netflix）\n"
-        "/change_ip 手动换 IP\n"
-        "/auto on|off 开关自动换 IP\n"
-        "/history 换 IP 记录\n"
-        "/ddns 手动同步 DDNS",
-        parse_mode="HTML", reply_markup=menu_kb())
+        f"👋 欢迎使用 <b>{html.escape(CFG.server_name)}</b> IP 管理机器人\n"
+        f"所有功能都在下面的面板里，底部「{PANEL_BTN}」随时打开。",
+        parse_mode="HTML",
+        reply_markup=ReplyKeyboardMarkup([[KeyboardButton(PANEL_BTN)]], resize_keyboard=True,
+                                         is_persistent=True))
+    await send_panel(update)
+
+
+@authorized
+async def cmd_panel(update: Update, ctx):
+    await send_panel(update)
 
 
 @authorized
 async def cmd_status(update: Update, ctx):
-    msg = await update.effective_message.reply_text("⏳ 检测中（约 10-20 秒）...")
-    await msg.edit_text(fmt_report(await run_checks()), parse_mode="HTML", reply_markup=menu_kb())
+    await send_panel(update, refresh=True)
 
 
 @authorized
 async def cmd_change(update: Update, ctx):
-    await update.effective_message.reply_text("确定要更换 IP 吗？", reply_markup=confirm_kb())
+    await update.effective_message.reply_text(confirm_text(), parse_mode="HTML",
+                                              reply_markup=confirm_kb())
 
 
 @authorized
@@ -513,77 +678,120 @@ async def cmd_auto(update: Update, ctx):
     if ctx.args and ctx.args[0].lower() in ("on", "off"):
         ST.auto = ctx.args[0].lower() == "on"
         ST.save()
-    await update.effective_message.reply_text(f"🤖 自动换 IP: {'开' if ST.auto else '关'}")
-
-
-def history_text():
-    if not ST.history:
-        return "暂无换 IP 记录"
-    rows = []
-    for h in ST.history[-10:][::-1]:
-        mark = "✅" if h["ok"] else "❌"
-        rows.append(f"{mark} {h['t'][5:16].replace('T', ' ')} {h['old']} → {h['new'] or '-'}\n"
-                    f"　　{html.escape(h['reason'])}")
-    return "📜 最近 10 次换 IP\n" + "\n".join(rows)
+    await update.effective_message.reply_text(
+        f"🤖 自动换 IP：{'已开启' if ST.auto else '已关闭'}", reply_markup=panel_kb())
 
 
 @authorized
 async def cmd_history(update: Update, ctx):
-    await update.effective_message.reply_text(history_text(), parse_mode="HTML")
+    await update.effective_message.reply_text(history_text(), parse_mode="HTML", reply_markup=back_kb())
 
 
 @authorized
 async def cmd_ddns(update: Update, ctx):
-    ip = await get_public_ip()
-    if not ip:
-        await update.effective_message.reply_text("获取公网 IP 失败")
-        return
-    await update.effective_message.reply_text(f"DDNS: {await update_ddns(ip)}")
+    m = await update.effective_message.reply_text("⏳ 正在同步 DDNS…")
+    await m.edit_text(await do_ddns(), parse_mode="HTML", reply_markup=back_kb())
 
+
+@authorized
+async def cmd_settings(update: Update, ctx):
+    await update.effective_message.reply_text(SETTINGS_TEXT, parse_mode="HTML", reply_markup=settings_kb())
+
+
+def confirm_text():
+    ip = LAST["r"]["ip"] if LAST else "未知"
+    return (f"<b>🔄 确定更换 IP？</b>\n\n当前 IP：<code>{ip}</code>\n"
+            "换 IP 期间网络会中断片刻，进度会单独推送。")
+
+
+# ── 按钮 ──
 
 @authorized
 async def on_button(update: Update, ctx):
     q = update.callback_query
-    await q.answer()
     d = q.data
-    if d == "status":
-        await q.edit_message_text("⏳ 检测中（约 10-20 秒）...")
-        await q.edit_message_text(fmt_report(await run_checks()), parse_mode="HTML",
-                                  reply_markup=menu_kb())
+
+    if d == "change_yes" and CHANGE_LOCK is not None and CHANGE_LOCK.locked():
+        await q.answer("已有换 IP 任务在进行，请稍候", show_alert=True)
+        return
+    await q.answer()
+
+    if d == "home":
+        await safe_edit(q, panel_text(), panel_kb())
+    elif d == "refresh":
+        await safe_edit(q, panel_text() + "\n\n⏳ <b>正在检测，约 10-20 秒…</b>")
+        await run_checks()
+        await safe_edit(q, panel_text(), panel_kb())
     elif d == "change":
-        await q.message.reply_text("确定要更换 IP 吗？", reply_markup=confirm_kb())
+        await safe_edit(q, confirm_text(), confirm_kb())
     elif d == "change_yes":
-        await q.edit_message_text("👌 已提交，进度会推送到这里")
+        await safe_edit(q, "🔄 <b>已开始更换 IP</b>\n\n进度和结果会单独推送到这里。", back_kb())
         ctx.application.create_task(change_ip(ctx.application, "手动更换", manual=True))
-    elif d == "cancel":
-        await q.edit_message_text("已取消")
     elif d == "auto":
         ST.auto = not ST.auto
         ST.save()
-        await q.edit_message_reply_markup(reply_markup=menu_kb())
+        await safe_edit(q, panel_text(), panel_kb())
+    elif d == "ddns":
+        await safe_edit(q, "⏳ 正在同步 DDNS…")
+        await safe_edit(q, await do_ddns(), back_kb())
     elif d == "history":
-        await q.message.reply_text(history_text(), parse_mode="HTML")
+        await safe_edit(q, history_text(), back_kb())
+    elif d == "help":
+        await safe_edit(q, HELP_TEXT, back_kb())
+    elif d == "settings":
+        await safe_edit(q, SETTINGS_TEXT, settings_kb())
+    elif d.startswith("s:"):
+        key = d[2:]
+        if key in ("check_gfw", "check_netflix"):
+            ST.set(key, not getattr(CFG, key))
+        elif key == "nf_require":
+            ST.set(key, "originals" if CFG.nf_require == "full" else "full")
+        elif key in CYCLES:
+            ST.set(key, _next(getattr(CFG, key), CYCLES[key]))
+            if key == "interval":
+                WAKE.set()
+        await safe_edit(q, SETTINGS_TEXT, settings_kb())
+
+
+async def on_error(update, ctx: ContextTypes.DEFAULT_TYPE):
+    log.error("处理更新出错: %s", ctx.error, exc_info=ctx.error)
 
 
 async def post_init(app: Application):
+    global WAKE
+    WAKE = asyncio.Event()
     await app.bot.set_my_commands([
-        BotCommand("status", "检测状态"),
-        BotCommand("change_ip", "手动换 IP"),
-        BotCommand("auto", "开关自动换 IP (on/off)"),
-        BotCommand("history", "换 IP 记录"),
-        BotCommand("ddns", "手动同步 DDNS"),
+        BotCommand("menu", "🏠 控制面板"),
+        BotCommand("status", "🔍 立即检测"),
+        BotCommand("change_ip", "🔄 更换 IP"),
+        BotCommand("ddns", "🌐 同步 DDNS"),
+        BotCommand("history", "📜 换 IP 记录"),
+        BotCommand("auto", "🤖 自动换 IP（on/off）"),
+        BotCommand("settings", "⚙️ 设置"),
     ])
     app.bot_data["monitor"] = asyncio.create_task(monitor_loop(app))
-    ip = await get_public_ip()
-    await notify(app, f"🟢 <b>{html.escape(CFG.server_name)}</b> 守护已启动 v{__version__}\nIP: <code>{ip}</code>\n"
-                      f"自动换 IP: {'开' if ST.auto else '关'}，每 {CFG.interval}s 检测一次",
-                 markup=menu_kb())
+    await run_checks()
+    await notify(app, f"🚀 <b>守护已启动</b> v{__version__}\n\n{panel_text()}", markup=panel_kb())
 
 
 async def post_shutdown(app: Application):
     t = app.bot_data.get("monitor")
     if t:
         t.cancel()
+
+
+def register_handlers(app: Application):
+    app.add_handler(CommandHandler(["start", "help"], cmd_start))
+    app.add_handler(CommandHandler("menu", cmd_panel))
+    app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("change_ip", cmd_change))
+    app.add_handler(CommandHandler("auto", cmd_auto))
+    app.add_handler(CommandHandler("history", cmd_history))
+    app.add_handler(CommandHandler("ddns", cmd_ddns))
+    app.add_handler(CommandHandler("settings", cmd_settings))
+    app.add_handler(MessageHandler(filters.Regex(f"^{PANEL_BTN}$"), cmd_panel))
+    app.add_handler(CallbackQueryHandler(on_button))
+    app.add_error_handler(on_error)
 
 
 def main():
@@ -608,15 +816,10 @@ def main():
         return
 
     ST = State(CFG.state_file, CFG.auto_default)
+    ST.apply_settings()
     app = (Application.builder().token(CFG.tg_token).concurrent_updates(True)
            .post_init(post_init).post_shutdown(post_shutdown).build())
-    app.add_handler(CommandHandler(["start", "help", "menu"], cmd_start))
-    app.add_handler(CommandHandler("status", cmd_status))
-    app.add_handler(CommandHandler("change_ip", cmd_change))
-    app.add_handler(CommandHandler("auto", cmd_auto))
-    app.add_handler(CommandHandler("history", cmd_history))
-    app.add_handler(CommandHandler("ddns", cmd_ddns))
-    app.add_handler(CallbackQueryHandler(on_button))
+    register_handlers(app)
     app.run_polling(drop_pending_updates=True)
 
 
