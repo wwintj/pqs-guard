@@ -32,7 +32,7 @@ from urllib.parse import urlparse
 
 import httpx
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 log = logging.getLogger("pqs-guard")
 

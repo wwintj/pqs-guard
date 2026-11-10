@@ -51,26 +51,63 @@ set_conf() {  # set_conf KEY VALUE —— 原样写入，不做转义
   chmod 600 "$tmp"; mv "$tmp" "$CONF"
 }
 
-install_deps() {
-  info "安装系统依赖"
+pkg_install() {  # 安装失败只警告，不中断（老系统软件源可能已失效）
+  local rc=0
   if command -v apt-get >/dev/null; then
-    DEBIAN_FRONTEND=noninteractive apt-get update -qq
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3 python3-venv curl >/dev/null
+    DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1 || true
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --fix-missing "$@" >/dev/null 2>&1 || rc=1
   elif command -v dnf >/dev/null; then
-    dnf install -y -q python3 curl
+    dnf install -y -q "$@" >/dev/null 2>&1 || rc=1
   elif command -v yum >/dev/null; then
-    yum install -y -q python3 curl
+    yum install -y -q "$@" >/dev/null 2>&1 || rc=1
   else
-    command -v python3 >/dev/null || die "未识别的系统，请先手动安装 python3"
+    rc=1
   fi
-  python3 -c 'import sys; sys.exit(sys.version_info < (3, 9))' || die "需要 Python 3.9 及以上"
+  [ "$rc" = 0 ] || yellow "⚠ 软件包安装失败: $*（软件源可能失效，将尝试其他方式）"
+}
+
+has_ensurepip() { python3 -c 'import ensurepip, venv' >/dev/null 2>&1; }
+
+install_deps() {
+  info "检查系统依赖"
+  local missing=()
+  command -v python3 >/dev/null || missing+=(python3)
+  command -v curl >/dev/null || missing+=(curl)
+  if [ ${#missing[@]} -gt 0 ]; then
+    pkg_install "${missing[@]}"
+  fi
+  command -v python3 >/dev/null || die "未找到 python3，且自动安装失败，请先修复软件源后手动安装 python3"
+  python3 -c 'import sys; sys.exit(sys.version_info < (3, 9))' || die "需要 Python 3.9 及以上（当前 $(python3 -V 2>&1)）"
+  if ! has_ensurepip && command -v apt-get >/dev/null; then
+    pkg_install python3-venv
+  fi
+  green "✓ $(python3 -V 2>&1)"
 }
 
 setup_venv() {
   info "安装 Python 依赖"
-  [ -x "$PY" ] || python3 -m venv "$APP_DIR/venv" || die "创建 venv 失败（Debian/Ubuntu 请安装 python3-venv）"
-  "$APP_DIR/venv/bin/pip" install -q --upgrade pip
-  "$APP_DIR/venv/bin/pip" install -q --upgrade "${PIP_PKGS[@]}"
+  if [ ! -x "$APP_DIR/venv/bin/pip" ]; then
+    rm -rf "$APP_DIR/venv"
+    if has_ensurepip && python3 -m venv "$APP_DIR/venv" >/dev/null 2>&1; then
+      :
+    else
+      # 没有 ensurepip（如 Debian 未装 python3-venv 且软件源失效）：建空 venv + 官方 get-pip.py
+      yellow "系统缺少 python3-venv，改用 get-pip.py 安装 pip"
+      rm -rf "$APP_DIR/venv"
+      python3 -m venv --without-pip "$APP_DIR/venv" || die "创建 venv 失败"
+      local ver getpip
+      ver=$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')
+      getpip=$(mktemp)
+      curl -fsSL --retry 3 -m 120 "https://bootstrap.pypa.io/pip/$ver/get-pip.py" -o "$getpip" 2>/dev/null \
+        || curl -fsSL --retry 3 -m 120 "https://bootstrap.pypa.io/get-pip.py" -o "$getpip" \
+        || die "下载 get-pip.py 失败"
+      "$PY" "$getpip" -q || die "安装 pip 失败"
+      rm -f "$getpip"
+    fi
+  fi
+  "$PY" -m pip install -q --upgrade pip
+  "$PY" -m pip install -q --upgrade "${PIP_PKGS[@]}" || die "安装 Python 依赖失败"
+  green "✓ Python 依赖就绪"
 }
 
 download_app() {  # 下载到临时目录，校验通过后再替换
