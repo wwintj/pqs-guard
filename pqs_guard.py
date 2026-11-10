@@ -24,7 +24,9 @@ import ipaddress
 import json
 import logging
 import os
+import random
 import socket
+import struct
 import sys
 import time
 from pathlib import Path
@@ -32,7 +34,7 @@ from urllib.parse import urlparse
 
 import httpx
 
-__version__ = "1.2.0"
+__version__ = "1.2.1"
 
 log = logging.getLogger("pqs-guard")
 
@@ -365,6 +367,7 @@ async def update_ddns(ip):
             if not z.get("success") or not z["result"]:
                 return f"Cloudflare 找不到 zone {CFG.cf_zone}: {z.get('errors')}"
             zid = z["result"][0]["id"]
+            ZONE_NS[:] = z["result"][0].get("name_servers") or []
             rec = (await c.get(f"{api}/zones/{zid}/dns_records",
                                params={"type": "A", "name": CFG.cf_record}, headers=h)).json()
             if not rec.get("success") or not rec["result"]:
@@ -381,22 +384,88 @@ async def update_ddns(ip):
         return f"DDNS 更新异常: {e}"
 
 
+ZONE_NS = []  # Cloudflare 权威 DNS 服务器，更新 DDNS 时从 API 获取
+
+
+def _dns_query_a(server, name, timeout=3.0):
+    """向指定 DNS 服务器发一个不递归的 A 记录查询（UDP），返回 IP 列表"""
+    tid = random.randint(0, 0xFFFF)
+    pkt = struct.pack(">HHHHHH", tid, 0, 1, 0, 0, 0)
+    pkt += b"".join(bytes([len(x)]) + x.encode() for x in name.rstrip(".").split(".")) + b"\0"
+    pkt += struct.pack(">HH", 1, 1)
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        sock.settimeout(timeout)
+        sock.sendto(pkt, (server, 53))
+        data = sock.recv(4096)
+    if struct.unpack(">H", data[:2])[0] != tid:
+        raise ValueError("DNS 响应 ID 不匹配")
+    qd, an = struct.unpack(">HH", data[4:8])
+
+    def skip_name(pos):
+        while True:
+            n = data[pos]
+            if n & 0xC0 == 0xC0:
+                return pos + 2
+            if n == 0:
+                return pos + 1
+            pos += n + 1
+
+    pos = 12
+    for _ in range(qd):
+        pos = skip_name(pos) + 4
+    ips = []
+    for _ in range(an):
+        pos = skip_name(pos)
+        rtype, _cls, _ttl, rdlen = struct.unpack(">HHIH", data[pos:pos + 10])
+        pos += 10
+        if rtype == 1 and rdlen == 4:
+            ips.append(socket.inet_ntoa(data[pos:pos + 4]))
+        pos += rdlen
+    return ips
+
+
+async def _authoritative_ok(ip):
+    """所有 Cloudflare 权威服务器都返回新 IP 才算生效；查不了返回 None"""
+    if not ZONE_NS:
+        return None
+    loop = asyncio.get_running_loop()
+    results = []
+    for ns in ZONE_NS:
+        try:
+            ns_ip = (await loop.getaddrinfo(ns, 53, family=socket.AF_INET))[0][4][0]
+            results.append(ip in await loop.run_in_executor(None, _dns_query_a, ns_ip, CFG.cf_record))
+        except Exception as e:
+            log.debug("权威 DNS %s 查询失败: %s", ns, e)
+    return all(results) if results else None
+
+
+async def _doh_ok(ip):
+    async with http_client(10) as c:
+        r = await c.get("https://cloudflare-dns.com/dns-query",
+                        params={"name": CFG.cf_record, "type": "A"},
+                        headers={"accept": "application/dns-json"})
+        return ip in [a.get("data") for a in r.json().get("Answer", [])]
+
+
 async def verify_dns(ip, timeout=60):
-    """用 DNS-over-HTTPS 查 Cloudflare，确认域名已解析到新 IP"""
+    """
+    确认 Cloudflare 已把域名解析到新 IP。
+    优先直接问 Cloudflare 的权威服务器（不受任何缓存影响，通常几秒内就是新 IP）；
+    权威服务器查不了时才退回用 1.1.1.1 的 DoH 查询（会受它自己缓存的影响）。
+    """
     if CFG.ddns_mode != "cloudflare":
         return None
     deadline = time.time() + timeout
-    async with http_client(10) as c:
-        while time.time() < deadline:
-            try:
-                r = await c.get("https://cloudflare-dns.com/dns-query",
-                                params={"name": CFG.cf_record, "type": "A"},
-                                headers={"accept": "application/dns-json"})
-                if ip in [a.get("data") for a in r.json().get("Answer", [])]:
-                    return True
-            except Exception:
-                pass
-            await asyncio.sleep(10)
+    while time.time() < deadline:
+        try:
+            ok = await _authoritative_ok(ip)
+            if ok is None:
+                ok = await _doh_ok(ip)
+            if ok:
+                return True
+        except Exception as e:
+            log.debug("DNS 生效检查失败: %s", e)
+        await asyncio.sleep(5)
     return False
 
 
@@ -478,7 +547,7 @@ async def change_ip(app, reason, manual=False):
         ddns = await update_ddns(new_ip)
         dns_ok = await verify_dns(new_ip)
         report = await run_checks()
-        dns_line = {True: "　✅ 已生效", False: "　⚠️ 尚未生效", None: ""}[dns_ok]
+        dns_line = {True: "　✅ Cloudflare 已生效", False: "　⏳ Cloudflare 生效中", None: ""}[dns_ok]
         tip = ""
         if CFG.ddns_mode != "none":
             tip = (f"\n\n💡 国内 DNS 会缓存旧 IP，域名可能要几分钟到十几分钟才连得上。"
