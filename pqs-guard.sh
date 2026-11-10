@@ -82,6 +82,32 @@ install_deps() {
     pkg_install python3-venv
   fi
   green "✓ $(python3 -V 2>&1)"
+  check_memory
+}
+
+check_memory() {
+  local total avail swap
+  total=$(awk '/^MemTotal:/{print int($2/1024)}' /proc/meminfo 2>/dev/null || echo 0)
+  avail=$(awk '/^MemAvailable:/{print int($2/1024)}' /proc/meminfo 2>/dev/null || echo 0)
+  swap=$(awk '/^SwapTotal:/{print int($2/1024)}' /proc/meminfo 2>/dev/null || echo 0)
+  info "内存: 总 ${total}MB，可用 ${avail}MB，swap ${swap}MB（本程序常驻约 40-60MB，已限制最多 150MB）"
+  if [ "$avail" -gt 0 ] && [ "$avail" -lt 200 ] && [ "$swap" -eq 0 ]; then
+    yellow "⚠ 可用内存不足 200MB 且没有 swap，安装依赖时可能被系统杀掉"
+    if confirm "创建 512MB swap 文件 /swapfile？" y; then
+      add_swap
+    fi
+  fi
+}
+
+add_swap() {
+  [ -e /swapfile ] && { yellow "/swapfile 已存在，跳过"; return; }
+  if fallocate -l 512M /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count=512 status=none; then
+    chmod 600 /swapfile && mkswap /swapfile >/dev/null && swapon /swapfile \
+      && { grep -q '^/swapfile ' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab; } \
+      && green "✓ 已启用 512MB swap" || { yellow "启用 swap 失败（部分 VPS 不支持），继续安装"; rm -f /swapfile; }
+  else
+    yellow "创建 swap 失败，继续安装"; rm -f /swapfile
+  fi
 }
 
 setup_venv() {
@@ -105,8 +131,9 @@ setup_venv() {
       rm -f "$getpip"
     fi
   fi
-  "$PY" -m pip install -q --upgrade pip
-  "$PY" -m pip install -q --upgrade "${PIP_PKGS[@]}" || die "安装 Python 依赖失败"
+  # --no-cache-dir：不留下载缓存，省磁盘和内存
+  "$PY" -m pip install -q --no-cache-dir --upgrade pip
+  "$PY" -m pip install -q --no-cache-dir --upgrade "${PIP_PKGS[@]}" || die "安装 Python 依赖失败（内存不足时可先加 swap）"
   green "✓ Python 依赖就绪"
 }
 

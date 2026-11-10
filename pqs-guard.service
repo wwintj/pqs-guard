@@ -10,6 +10,15 @@ ExecStart=/opt/pqs-guard/venv/bin/python /opt/pqs-guard/pqs_guard.py
 Restart=always
 RestartSec=10
 StateDirectory=pqs-guard
+# 小内存机器保护：正常占用约 40-60MB
+# 减少 glibc 内存碎片
+Environment=MALLOC_ARENA_MAX=2
+Environment=PYTHONUNBUFFERED=1
+# 超过 80M 开始回收，超过 150M 直接被杀并由 systemd 重启，绝不拖垮 x-ui
+MemoryHigh=80M
+MemoryMax=150M
+# 内存紧张时优先杀本程序，保护 x-ui
+OOMScoreAdjust=500
 
 [Install]
 WantedBy=multi-user.target
