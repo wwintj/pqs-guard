@@ -32,7 +32,7 @@ from urllib.parse import urlparse
 
 import httpx
 
-__version__ = "1.1.1"
+__version__ = "1.1.2"
 
 log = logging.getLogger("pqs-guard")
 
@@ -460,7 +460,7 @@ async def change_ip(app, reason, manual=False):
         await asyncio.sleep(5)
         report = await run_checks()
         await notify(app, f"✅ <b>换 IP 完成</b>\n<code>{old_ip}</code> → <code>{new_ip}</code>\n"
-                          f"DDNS：{html.escape(ddns)}\n\n{fmt_report(report)}", markup=panel_kb())
+                          f"🔗 <b>DDNS</b>　{html.escape(ddns)}\n\n{fmt_report(report)}", markup=panel_kb())
 
 
 # ───────────────────────────── 自动监控循环 ─────────────────────────────
