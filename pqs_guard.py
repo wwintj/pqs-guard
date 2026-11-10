@@ -32,7 +32,7 @@ from urllib.parse import urlparse
 
 import httpx
 
-__version__ = "1.1.3"
+__version__ = "1.2.0"
 
 log = logging.getLogger("pqs-guard")
 
@@ -559,17 +559,15 @@ def _next(cur, opts):
 
 
 def panel_kb():
-    auto = "🟢 自动换 IP：已开启" if ST.auto else "⚪️ 自动换 IP：已关闭"
+    auto = "🟢 自动：开" if ST.auto else "⚪️ 自动：关"
     return InlineKeyboardMarkup([
-        [B("🔍 立即检测", callback_data="refresh"), B("🔄 更换 IP", callback_data="change")],
-        [B("🌐 同步 DDNS", callback_data="ddns"), B("📜 换 IP 记录", callback_data="history")],
-        [B(auto, callback_data="auto")],
-        [B("⚙️ 设置", callback_data="settings"), B("❓ 说明", callback_data="help")],
+        [B("🔍 检测", callback_data="refresh"), B("🔄 换 IP", callback_data="change")],
+        [B(auto, callback_data="auto"), B("⚙️ 更多", callback_data="settings")],
     ])
 
 
-def back_kb():
-    return InlineKeyboardMarkup([[B("◀️ 返回面板", callback_data="home")]])
+def back_kb(to="home"):
+    return InlineKeyboardMarkup([[B("◀️ 返回", callback_data=to)]])
 
 
 def confirm_kb():
@@ -580,6 +578,7 @@ def confirm_kb():
 def settings_kb():
     on = lambda b: "开" if b else "关"  # noqa: E731
     return InlineKeyboardMarkup([
+        [B("🌐 同步 DDNS", callback_data="ddns"), B("📜 换 IP 记录", callback_data="history")],
         [B(f"🧱 被墙检测：{on(CFG.check_gfw)}", callback_data="s:check_gfw"),
          B(f"🎬 Netflix 检测：{on(CFG.check_netflix)}", callback_data="s:check_netflix")],
         [B(f"🎯 Netflix 要求：{'全解锁' if CFG.nf_require == 'full' else '仅自制剧'}",
@@ -587,19 +586,19 @@ def settings_kb():
         [B(f"⏱ 检测间隔：{CFG.interval // 60} 分钟", callback_data="s:interval"),
          B(f"🔁 连续失败：{CFG.fail_threshold} 次", callback_data="s:fail_threshold")],
         [B(f"📅 每日自动上限：{CFG.max_per_day} 次", callback_data="s:max_per_day")],
-        [B("◀️ 返回面板", callback_data="home")],
+        [B("❓ 说明", callback_data="help"), B("◀️ 返回", callback_data="home")],
     ])
 
 
 def panel_text():
     if LAST:
         return fmt_report(LAST["r"], LAST["t"])
-    return (f"<b>🖥 {html.escape(CFG.server_name)}</b>\n\n还没有检测结果，点「🔍 立即检测」")
+    return (f"<b>🖥 {html.escape(CFG.server_name)}</b>\n\n还没有检测结果，点「🔍 检测」")
 
 
 SETTINGS_TEXT = (
-    "<b>⚙️ 设置</b>\n\n"
-    "点按钮即可切换，立即生效并永久保存。\n\n"
+    "<b>⚙️ 更多</b>\n\n"
+    "设置项点一下即切换，立即生效并永久保存。\n\n"
     "• <b>被墙检测 / Netflix 检测</b>：关掉后不再因此自动换 IP\n"
     "• <b>Netflix 要求</b>：全解锁 = 必须能看非自制剧；仅自制剧 = 能看自制剧就行\n"
     "• <b>检测间隔</b>：多久自动检测一次\n"
@@ -609,11 +608,10 @@ SETTINGS_TEXT = (
 
 HELP_TEXT = (
     "<b>❓ 说明</b>\n\n"
-    "🔍 <b>立即检测</b>：查看当前 IP、是否被墙、Netflix 解锁情况\n"
-    "🔄 <b>更换 IP</b>：手动换 IP，完成后自动同步 DDNS 并复检\n"
-    "🌐 <b>同步 DDNS</b>：把域名解析更新为当前 IP\n"
-    "📜 <b>换 IP 记录</b>：最近 10 次换 IP\n"
-    "🤖 <b>自动换 IP</b>：被墙或 Netflix 不达标时自动更换\n\n"
+    "🔍 <b>检测</b>：查看当前 IP、是否被墙、Netflix 解锁情况\n"
+    "🔄 <b>换 IP</b>：手动换 IP，完成后自动同步 DDNS 并复检\n"
+    "🤖 <b>自动</b>：被墙或 Netflix 不达标时自动换 IP，点击开关\n"
+    "⚙️ <b>更多</b>：同步 DDNS、换 IP 记录、各项设置\n\n"
     "<b>被墙判定</b>：国外能通，但国内目标全部连不上，且连续多次。"
     "「国内 3/4 可达」表示 4 个国内目标连上 3 个，只要有 1 个能连就是正常。\n\n"
     f"底部「{PANEL_BTN}」按钮随时打开本面板。"
@@ -764,11 +762,11 @@ async def on_button(update: Update, ctx):
         await safe_edit(q, panel_text(), panel_kb())
     elif d == "ddns":
         await safe_edit(q, "⏳ 正在同步 DDNS…")
-        await safe_edit(q, await do_ddns(), back_kb())
+        await safe_edit(q, await do_ddns(), back_kb("settings"))
     elif d == "history":
-        await safe_edit(q, history_text(), back_kb())
+        await safe_edit(q, history_text(), back_kb("settings"))
     elif d == "help":
-        await safe_edit(q, HELP_TEXT, back_kb())
+        await safe_edit(q, HELP_TEXT, back_kb("settings"))
     elif d == "settings":
         await safe_edit(q, SETTINGS_TEXT, settings_kb())
     elif d.startswith("s:"):
