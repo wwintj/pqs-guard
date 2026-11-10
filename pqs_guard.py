@@ -32,7 +32,7 @@ from urllib.parse import urlparse
 
 import httpx
 
-__version__ = "1.1.2"
+__version__ = "1.1.3"
 
 log = logging.getLogger("pqs-guard")
 
@@ -381,6 +381,25 @@ async def update_ddns(ip):
         return f"DDNS 更新异常: {e}"
 
 
+async def verify_dns(ip, timeout=60):
+    """用 DNS-over-HTTPS 查 Cloudflare，确认域名已解析到新 IP"""
+    if CFG.ddns_mode != "cloudflare":
+        return None
+    deadline = time.time() + timeout
+    async with http_client(10) as c:
+        while time.time() < deadline:
+            try:
+                r = await c.get("https://cloudflare-dns.com/dns-query",
+                                params={"name": CFG.cf_record, "type": "A"},
+                                headers={"accept": "application/dns-json"})
+                if ip in [a.get("data") for a in r.json().get("Answer", [])]:
+                    return True
+            except Exception:
+                pass
+            await asyncio.sleep(10)
+    return False
+
+
 # ───────────────────────────── 换 IP ─────────────────────────────
 
 async def notify(app, text, chat_id=None, markup=None):
@@ -457,10 +476,16 @@ async def change_ip(app, reason, manual=False):
         entry.update(new=new_ip, ok=True)
         ST.save()
         ddns = await update_ddns(new_ip)
-        await asyncio.sleep(5)
+        dns_ok = await verify_dns(new_ip)
         report = await run_checks()
+        dns_line = {True: "　✅ 已生效", False: "　⚠️ 尚未生效", None: ""}[dns_ok]
+        tip = ""
+        if CFG.ddns_mode != "none":
+            tip = (f"\n\n💡 国内 DNS 会缓存旧 IP，域名可能要几分钟到十几分钟才连得上。"
+                   f"急用可直接连新 IP：<code>{new_ip}</code>")
         await notify(app, f"✅ <b>换 IP 完成</b>\n<code>{old_ip}</code> → <code>{new_ip}</code>\n"
-                          f"🔗 <b>DDNS</b>　{html.escape(ddns)}\n\n{fmt_report(report)}", markup=panel_kb())
+                          f"🔗 <b>DDNS</b>　{html.escape(ddns)}{dns_line}{tip}\n\n{fmt_report(report)}",
+                     markup=panel_kb())
 
 
 # ───────────────────────────── 自动监控循环 ─────────────────────────────
