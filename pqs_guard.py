@@ -32,7 +32,7 @@ from urllib.parse import urlparse
 
 import httpx
 
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 
 log = logging.getLogger("pqs-guard")
 
@@ -416,12 +416,16 @@ async def change_ip(app, reason, manual=False):
         await notify(app, f"🔄 <b>{html.escape(CFG.server_name)}</b> 开始换 IP\n"
                           f"原因: {html.escape(reason)}\n旧 IP: <code>{old_ip}</code>")
         try:
-            async with http_client(60) as c:
+            async with http_client(30) as c:
                 r = await c.get(CFG.pqs_url)
             api_resp = f"HTTP {r.status_code}: {r.text.strip()[:200]}"
             api_ok = r.status_code < 400
+        except (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError) as e:
+            # 换 IP 会切断本机网络，接口响应回不来是正常现象 → 不判失败，看 IP 有没有变
+            api_resp = f"无响应（{type(e).__name__}），换 IP 时连接中断属正常"
+            api_ok = None
         except Exception as e:
-            api_resp, api_ok = f"请求异常: {e}", False
+            api_resp, api_ok = f"请求异常: {type(e).__name__} {e}".strip(), False
         log.info("PQS API: %s", api_resp)
 
         entry = {"t": dt.datetime.now().isoformat(timespec="seconds"), "reason": reason,
@@ -430,9 +434,11 @@ async def change_ip(app, reason, manual=False):
         ST.history.append(entry)
         ST.save()
 
-        if not api_ok:
+        if api_ok is False:
             await notify(app, f"❌ 换 IP 接口调用失败\n<code>{html.escape(api_resp)}</code>", markup=panel_kb())
             return
+        if api_ok is None:
+            await notify(app, f"⏳ 接口{html.escape(api_resp)}\n正在确认 IP 是否已更换（最多 {CFG.ip_wait}s）…")
 
         new_ip, deadline = None, time.time() + CFG.ip_wait
         await asyncio.sleep(10)
