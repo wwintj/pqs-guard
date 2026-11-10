@@ -4,13 +4,13 @@ PQS 服务器的 IP 守护程序，可以用 Telegram 机器人控制：
 
 | 功能 | 说明 |
 |---|---|
-| 手动换 IP | 控制面板点「更换 IP」，需要二次确认 |
-| 状态检测 | `/status` 查看当前 IP、是否被墙、Netflix 解锁情况 |
+| 手动换 IP | 控制面板点「🔄 换 IP」，需要二次确认 |
+| 状态检测 | 控制面板点「🔍 检测」，查看当前 IP、是否被墙、Netflix 解锁情况 |
 | 被墙自动换 IP | 国外能通、国内全部不通，连续 2 次才换 |
 | Netflix 自动换 IP | 看不了非自制剧（或可设为只要求自制剧），连续 2 次才换 |
-| 换 IP 后自动处理 | 等新 IP 生效 → 更新 DDNS（Cloudflare / 自定义 URL）→ 再检测一次 → 推送结果 |
-| 防止换个不停 | 冷却 10 分钟、每天上限 8 次、同一时间只跑一个换 IP 任务 |
-| 控制面板 | 所有功能都在按钮里：检测、换 IP、同步 DDNS、记录、自动开关、设置（检测间隔、Netflix 要求等，点一下就生效） |
+| 换 IP 后自动处理 | 等新 IP 生效 → 更新 DDNS（Cloudflare / 自定义 URL）→ 确认 DNS 已生效 → 再检测一次 → 推送结果 |
+| 防止换个不停 | 冷却 10 分钟、每天自动换 IP 默认最多 8 次（可在面板里改）、同一时间只跑一个换 IP 任务 |
+| 控制面板 | 主面板 4 个按钮：检测、换 IP、自动开关、更多。「更多」里有同步 DDNS、换 IP 记录和各项设置，点一下就生效 |
 
 ## 一键安装
 
@@ -55,9 +55,100 @@ pqs-guard restart      # 重启
 
 ## DDNS 选哪种
 
-- **PQS 后台生成的 DDNS 域名**（会自动跟着 IP 变）：选「不需要」。如果想用自己的域名，就在 DNS 服务商那里加一条 CNAME 指向它。
-- **Cloudflare**：用 API Token，只给 `Zone → DNS → Edit` 权限。不要用 Global API Key。
-- **自定义 URL**：换完 IP 后访问一次这个地址，地址里的 `{ip}` 会替换成新 IP。
+换 IP 后，你的域名要跟着指向新 IP，客户端和 SSH 才连得上。有三种做法：
+
+| 方式 | 适合 | 安装时选 |
+|---|---|---|
+| PQS 生成的 DDNS 域名 | 不想折腾，PQS 自己会让域名跟着 IP 变 | `1) 不需要` |
+| Cloudflare | 想用自己的域名，域名托管在 Cloudflare（**推荐**） | `2) Cloudflare` |
+| 自定义 URL | 其他 DDNS 服务，访问一个地址就能更新 | `3) 自定义 URL`，地址里的 `{ip}` 会被替换成新 IP |
+
+用 PQS 的 DDNS 域名，又想换成自己的域名时，可以在 DNS 服务商那里加一条 **CNAME** 指向 PQS 的域名，然后选「不需要」。
+
+## Cloudflare DDNS 详细设置
+
+下面用 `example.com` 举例，实际操作时换成你自己的域名。假设要让 `node.example.com` 始终指向这台服务器。
+
+### 第 1 步：先建好 A 记录
+
+**程序只修改已有记录的 IP，不会新建记录**，所以要先手动建一条。
+
+1. 登录 [Cloudflare 控制台](https://dash.cloudflare.com)，在首页的 **Domains** 列表里点你的域名，例如 `example.com`
+2. 左侧菜单进入 **DNS → Records**，点 **Add record**
+3. 按下表填写，然后点 **Save**：
+
+| 字段 | 填写 |
+|---|---|
+| Type | `A` |
+| Name | `node`（只填前缀，完整域名就是 `node.example.com`） |
+| IPv4 address | 服务器当前 IP（随便填也可以，换 IP 时会自动改掉） |
+| Proxy status | **关闭，小云朵必须是灰色（DNS only）** |
+| TTL | `Auto` 或 `1 min`（程序更新时会自动设成 60 秒） |
+
+> ⚠️ **小云朵一定要是灰色**。橙色表示流量走 Cloudflare 的代理，代理节点和 SSH 都连不上。
+
+### 第 2 步：创建 API Token
+
+API Token 只给改 DNS 的权限，比 Global API Key 安全得多。Global API Key 能操作整个 Cloudflare 账号，**不要用**。
+
+1. 打开 <https://dash.cloudflare.com/profile/api-tokens>，也可以点右上角头像 → **My Profile** → **API Tokens**
+2. 点 **Create Token**
+3. **Token name**：随便起，例如 `pqs-guard-node`
+4. **Policies**：选 **Edit zone DNS** 模板，会自动生成一条 `Zone policy · Include · DNS Write`
+5. **把范围限制到一个域名（重要）**：点这条策略右边的 ✏️ 铅笔图标，把 zone 设为 **Specific zone → `example.com`** 后保存。默认可能是「所有域名」，那样这个 token 就能改你账号下所有域名的 DNS
+6. **Token expiration**：选 **No expiration**。设了过期时间的话，到期后 DDNS 会悄悄失效
+7. **Client IP address filtering**：**留空**。不要填服务器 IP，程序就是负责换 IP 的，填了以后 IP 一换 token 就用不了了
+8. 点 **Continue to summary**，确认显示的是 `example.com - DNS:Edit`，然后点 **Create Token**
+9. **马上复制 token**，它只显示这一次。弄丢了只能重新创建
+
+### 第 3 步：填进程序
+
+**新安装**：安装向导问 DDNS 时选 `2`，依次填：
+
+```
+Cloudflare API Token（只需 Zone.DNS:Edit 权限）: 粘贴第 2 步的 token
+根域名，如 example.com: example.com
+要更新的完整域名，如 node.example.com: node.example.com
+```
+
+**已经装好了**：运行 `pqs-guard config` → `1) 重新走一遍配置向导`。也可以直接编辑 `/etc/pqs-guard/config.env`：
+
+```ini
+DDNS_MODE=cloudflare
+CF_API_TOKEN=你的token
+CF_ZONE_NAME=example.com
+CF_RECORD_NAME=node.example.com
+```
+
+改完后运行 `pqs-guard restart`。
+
+### 第 4 步：验证
+
+在 Telegram 控制面板点 **⚙️ 更多 → 🌐 同步 DDNS**：
+
+| 机器人回复 | 意思 |
+|---|---|
+| `node.example.com 已是 1.2.3.4` | ✅ 配置正确，记录已经是当前 IP |
+| `node.example.com: 旧IP → 新IP` | ✅ 配置正确，刚刚改好了 |
+| `Cloudflare 找不到 zone example.com` | token 权限范围不对，或根域名填错了。先检查第 2 步第 5 点；还不行就给 token 再加一条 **Zone → Zone → Read** 权限，范围同样只选这个域名 |
+| `Cloudflare 找不到 A 记录 node.example.com` | 第 1 步的记录没建，或完整域名填错了，也可能建成了 CNAME 等其他类型 |
+| `Invalid API Token` / `Authentication error` | token 复制错了或已被删除，重新创建一个 |
+
+### 一个服务器一个域名
+
+多台服务器时，**每台用自己的子域名**，例如 `node1.example.com`、`node2.example.com`，各建一条 A 记录。
+
+API Token 可以共用同一个，也可以每台单独建一个。单独建更安全：某台服务器出问题时，只需要删掉它那一个 token。
+
+### 换 IP 后域名为什么还连不上？
+
+Cloudflare 那边通常几秒内就生效了，换 IP 完成的通知里会显示「✅ 已生效」。但国内的 DNS（114、阿里、运营商等）经常**不遵守 TTL**，会把旧 IP 多缓存几分钟到十几分钟。这段时间里：
+
+- 客户端用域名会连到旧 IP，所以连不上
+- 急用的话，直接用通知里写的新 IP 连接
+- 电脑上可以把 DNS 换成 `1.1.1.1` / `8.8.8.8`。Mac 还可以运行 `sudo dscacheutil -flushcache; sudo killall -HUP mDNSResponder` 清掉本机缓存
+
+这是 DNS 缓存的特性，程序没办法彻底解决。所以自动换 IP 只在真正被墙或 Netflix 不达标时才会触发。
 
 ## 检测原理与局限
 
