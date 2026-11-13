@@ -376,7 +376,7 @@ do_probe() {
     echo "  0) 返回"
     ask v "请选择" 1
     case "$v" in
-      1) show_probe_install "$cur_port" "$cur_key" "$cur_names"; return ;;
+      1) ensure_probe_key; show_probe_install "$cur_port" "$cur_key" "$cur_names"; return ;;
       2) ;;
       3) set_conf PROBE_PORT 0; start_service; green "探针功能已关闭"; return ;;
       *) return ;;
@@ -399,14 +399,20 @@ do_probe() {
   [[ "$v" =~ ^[0-9]+$ ]] || die "端口必须是数字"
   set_conf PROBE_PORT "$v"; cur_port=$v
 
-  if [ -z "$cur_key" ]; then
-    cur_key=$(tr -dc 'a-z0-9' < /dev/urandom | head -c 24)
-    set_conf PROBE_KEY "$cur_key"
-  fi
+  ensure_probe_key
 
   open_firewall "$cur_port"
   start_service
   show_probe_install "$cur_port" "$cur_key" "$cur_names"
+}
+
+ensure_probe_key() {  # 没有密钥就生成一个（head 放在管道最前面，避免 pipefail 下 SIGPIPE 让脚本中途退出）
+  [ -n "$cur_key" ] && return
+  cur_key=$(head -c 12 /dev/urandom | od -An -tx1 | tr -d ' \n')
+  [ -n "$cur_key" ] || die "生成探针密钥失败"
+  set_conf PROBE_KEY "$cur_key"
+  yellow "已生成探针密钥并写入配置，重启服务使其生效"
+  start_service
 }
 
 show_probe_install() {  # show_probe_install 端口 密钥 名称列表
