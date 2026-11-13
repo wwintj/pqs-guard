@@ -343,15 +343,14 @@ detect_node_ports() {  # 从 xray / x-ui 等进程的监听端口猜节点端口
 }
 
 open_firewall() {  # open_firewall 端口
-  if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q '^Status: active'; then
+  if command -v ufw >/dev/null && LANG=C ufw status 2>/dev/null | grep -q '^Status: active'; then
     ufw allow "$1"/tcp >/dev/null && green "✓ ufw 已放行 $1/tcp"
   elif command -v firewall-cmd >/dev/null && firewall-cmd --state >/dev/null 2>&1; then
     firewall-cmd --permanent --add-port="$1"/tcp >/dev/null && firewall-cmd --reload >/dev/null && green "✓ firewalld 已放行 $1/tcp"
-  elif iptables -S INPUT 2>/dev/null | grep -q -- '-P INPUT DROP'; then
-    iptables -C INPUT -p tcp --dport "$1" -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport "$1" -j ACCEPT
-    yellow "已用 iptables 放行 $1/tcp（重启后可能失效，请按你的防火墙方式持久化）"
-  else
-    info "未检测到防火墙，端口 $1 应可直接访问"
+  fi
+  if command -v iptables >/dev/null; then
+    iptables -C INPUT -p tcp --dport "$1" -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport "$1" -j ACCEPT 2>/dev/null || true
+    green "✓ iptables 已放行 $1/tcp（服务启动时也会自动维护）"
   fi
 }
 

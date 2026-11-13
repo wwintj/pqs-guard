@@ -34,7 +34,7 @@ from urllib.parse import urlparse
 
 import httpx
 
-__version__ = "1.3.2"
+__version__ = "1.3.3"
 
 log = logging.getLogger("pqs-guard")
 
@@ -543,8 +543,8 @@ def probe_verdict():
         left = int((CFG.probe_grace - (now - ST.last_change)) // 60) + 1
         return {"state": "grace", "per": per, "detail": f"刚换 IP，{left} 分钟后开始采信"}
     online = {n: st for n, st in per.items() if st != "offline"}
-    if not names:
-        return {"state": "silent", "per": per, "detail": "尚无探针上报"}
+    if not names or not PROBES:
+        return {"state": "wait", "per": per, "detail": "等待探针首次上报"}
     if not online:
         return {"state": "silent", "per": per, "detail": "全部失联"}
     bad = [n for n, st in online.items() if st == "fail"]
@@ -652,10 +652,22 @@ async def _probe_http(reader, writer):
         writer.close()
 
 
+def _ensure_port_open(port):
+    import subprocess
+    cmd = ["iptables", "-C", "INPUT", "-p", "tcp", "--dport", str(port), "-j", "ACCEPT"]
+    try:
+        if subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode != 0:
+            cmd[1] = "-I"
+            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
+
 async def start_probe_server():
     global PROBE_SERVER
     if not CFG.probes_enabled:
         return
+    _ensure_port_open(CFG.probe_port)
     PROBE_SERVER = await asyncio.start_server(_probe_http, "0.0.0.0", CFG.probe_port)
     log.info("探针接收端口已开启: %d", CFG.probe_port)
 
@@ -855,16 +867,18 @@ def confirm_kb():
 
 def settings_kb():
     on = lambda b: "开" if b else "关"  # noqa: E731
+    top = [B("🌐 同步 DDNS", callback_data="ddns"), B("📜 换 IP 记录", callback_data="history")]
+    if CFG.probes_enabled:
+        top.append(B("🏠 探针状态", callback_data="probes"))
     return InlineKeyboardMarkup([
-        [B("🌐 同步 DDNS", callback_data="ddns"), B("📜 换 IP 记录", callback_data="history")],
-    ] + ([[B("🏠 探针状态", callback_data="probes")]] if CFG.probes_enabled else []) + [
+        top,
         [B(f"🧱 被墙检测：{on(CFG.check_gfw)}", callback_data="s:check_gfw"),
          B(f"🎬 Netflix 检测：{on(CFG.check_netflix)}", callback_data="s:check_netflix")],
-        [B(f"🎯 Netflix 要求：{'全解锁' if CFG.nf_require == 'full' else '仅自制剧'}",
-           callback_data="s:nf_require")],
+        [B(f"🎯 解锁要求：{'全解锁' if CFG.nf_require == 'full' else '仅自制剧'}",
+           callback_data="s:nf_require"),
+         B(f"📅 每日上限：{CFG.max_per_day} 次", callback_data="s:max_per_day")],
         [B(f"⏱ 检测间隔：{CFG.interval // 60} 分钟", callback_data="s:interval"),
          B(f"🔁 连续失败：{CFG.fail_threshold} 次", callback_data="s:fail_threshold")],
-        [B(f"📅 每日自动上限：{CFG.max_per_day} 次", callback_data="s:max_per_day")],
         [B("❓ 说明", callback_data="help"), B("◀️ 返回", callback_data="home")],
     ])
 
@@ -876,13 +890,11 @@ def panel_text():
 
 
 SETTINGS_TEXT = (
-    "<b>⚙️ 更多</b>\n\n"
-    "设置项点一下即切换，立即生效并永久保存。\n\n"
-    "• <b>被墙检测 / Netflix 检测</b>：关掉后不再因此自动换 IP\n"
-    "• <b>Netflix 要求</b>：全解锁 = 必须能看非自制剧；仅自制剧 = 能看自制剧就行\n"
-    "• <b>检测间隔</b>：多久自动检测一次\n"
-    "• <b>连续失败</b>：连续几次异常才换 IP，防误判\n"
-    "• <b>每日自动上限</b>：每天最多自动换几次。手动换 IP 单独计数，不受限制"
+    "<b>⚙️ 更多设置</b>（点击按钮直接切换）\n\n"
+    "• <b>被墙 / Netflix</b>：关闭后不再因此自动换 IP\n"
+    "• <b>解锁要求</b>：全解锁（含非自制剧）或仅自制剧\n"
+    "• <b>检测间隔 / 连续失败</b>：多久测一次、连续几次异常才换\n"
+    "• <b>每日上限</b>：自动换 IP 每日上限（手动不限）"
 )
 
 HELP_TEXT = (

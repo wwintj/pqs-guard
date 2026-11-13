@@ -22,13 +22,13 @@ command -v curl >/dev/null || { echo "需要 curl"; exit 1; }
 log() { printf '%s %s\n' "$(date '+%m-%d %H:%M:%S')" "$*"; }
 
 tcp_check() {  # tcp_check IP 端口 → 0 通 / 1 不通
-  if command -v timeout >/dev/null 2>&1; then
-    timeout 5 bash -c "exec 3<>/dev/tcp/$1/$2" 2>/dev/null && return 0
-    return 1
-  fi
   if command -v nc >/dev/null 2>&1; then
     nc -z -w 5 "$1" "$2" >/dev/null 2>&1 && return 0
     nc -z -G 5 "$1" "$2" >/dev/null 2>&1 && return 0   # macOS
+    return 1
+  fi
+  if command -v timeout >/dev/null 2>&1; then
+    timeout 5 bash -c "exec 3<>/dev/tcp/$1/$2" 2>/dev/null && return 0
     return 1
   fi
   # 没有 timeout 也没有 nc：裸 /dev/tcp + 后台看门狗
@@ -44,14 +44,14 @@ resolve_doh() {  # 用阿里 DoH 解析域名（比运营商 DNS 更新得快）
     | grep -o '"data":"[0-9.]*"' | head -1 | cut -d'"' -f4
 }
 
-# 依次尝试：上次成功的 IP → 域名 → DoH 解析到的 IP
+# 依次尝试：上次成功的 IP → DoH 解析到的 IP → 域名（本地 DNS 常缓存旧 IP，放最后）
 candidate_hosts() {
   local cached=""
   [ -f "$CACHE" ] && cached=$(sed -n '1p' "$CACHE" | awk '{print $1}')
   [ -n "$cached" ] && echo "$cached"
-  echo "$SERVER"
   local doh; doh=$(resolve_doh)
   [ -n "$doh" ] && [ "$doh" != "$cached" ] && echo "$doh"
+  echo "$SERVER"
 }
 
 run_once() {
