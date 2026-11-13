@@ -294,7 +294,7 @@ do_upgrade() {
   is_installed || die "尚未安装，请先安装"
   local old new
   old=$("$PY" "$APP_DIR/pqs_guard.py" --version 2>/dev/null || echo "?")
-  new=$(curl -fsSL -m 30 "$RAW/pqs_guard.py" | grep -m1 '^__version__' | cut -d'"' -f2 || true)
+  new=$(curl -fsSL -m 30 "$RAW/pqs_guard.py" 2>/dev/null | grep '^__version__' | head -n1 | cut -d'"' -f2 || true)
   info "当前版本 $old，最新版本 ${new:-未知}"
   if [ -n "$new" ] && [ "$old" = "$new" ] && ! confirm "已是最新，仍要重新安装？" n; then
     return
