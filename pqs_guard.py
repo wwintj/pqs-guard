@@ -34,7 +34,7 @@ from urllib.parse import urlparse
 
 import httpx
 
-__version__ = "1.2.2"
+__version__ = "1.3.0"
 
 log = logging.getLogger("pqs-guard")
 
@@ -102,7 +102,19 @@ class Config:
         self.cf_zone = _env("CF_ZONE_NAME")
         self.cf_record = _env("CF_RECORD_NAME")
 
+        # 家庭探针：国内设备定时连接节点端口并上报，用来发现"只封端口"和线路问题
+        self.probe_port = int(_env("PROBE_PORT", "0") or 0)  # 0 = 不启用
+        self.probe_key = _env("PROBE_KEY")
+        self.probe_names = _env_list("PROBE_NAMES", "")
+        self.node_ports = [int(x) for x in _env_list("NODE_PORTS", "") if x.isdigit()]
+        self.probe_stale = int(_env("PROBE_STALE", "600"))
+        self.probe_grace = int(_env("PROBE_GRACE", "1200"))
+
         self.state_file = Path(_env("STATE_FILE", "/var/lib/pqs-guard/state.json"))
+
+    @property
+    def probes_enabled(self):
+        return self.probe_port > 0 and bool(self.node_ports)
 
     def validate(self, need_bot=True):
         errs = []
@@ -124,6 +136,10 @@ class Config:
                 errs.append("DDNS_MODE=cloudflare 需要 CF_ZONE_NAME 和 CF_RECORD_NAME")
         if self.ddns_mode == "url" and not self.ddns_url:
             errs.append("DDNS_MODE=url 需要 DDNS_URL")
+        if self.probe_port and not self.probe_key:
+            errs.append("启用探针（PROBE_PORT）需要设置 PROBE_KEY")
+        if self.probe_port and not self.node_ports:
+            errs.append("启用探针（PROBE_PORT）需要设置 NODE_PORTS")
         if errs:
             sys.exit("配置错误:\n  - " + "\n  - ".join(errs))
 
@@ -338,8 +354,11 @@ def _ddns_text():
 
 def fmt_report(r, ts=None):
     g, n = r["gfw"], r["nf"]
+    pv = probe_verdict()
     if g["state"] == "blocked":
         head = "🔴 IP 被墙"
+    elif pv["state"] in ("blocked", "silent"):
+        head = "🔴 国内连不上节点"
     elif n.get("ok") is False:
         head = "🟡 Netflix 不达标"
     elif g["state"] == "unknown" or (n["state"] == "unknown"):
@@ -354,6 +373,7 @@ def fmt_report(r, ts=None):
         f"🧱 <b>墙</b>　{_gfw_text(g)}",
         f"🎬 <b>Netflix</b>　{html.escape(_nf_text(n))}",
         f"🔗 <b>DDNS</b>　{html.escape(_ddns_text())}",
+    ] + ([f"🏠 <b>探针</b>　{html.escape(_probe_text(pv))}"] if CFG.probes_enabled else []) + [
         "",
         f"🤖 自动换 IP <b>{'开' if ST.auto else '关'}</b> · 今日自动 {ST.today_count('auto')}/{CFG.max_per_day}"
         f" · 手动 {ST.today_count('manual')}",
@@ -481,6 +501,165 @@ async def verify_dns(ip, timeout=60):
     return False
 
 
+# ───────────────────────────── 家庭探针 ─────────────────────────────
+# 协议（HTTP，明文，靠 key 鉴权）：
+#   GET  /targets?key=K&name=N            → "IP PORT PORT ..."   探针据此知道要测哪个 IP 的哪些端口
+#   POST /report   key=K&name=N&ip=..&r=443:ok,8443:fail        探针上报结果
+# 被墙时探针根本连不上本服务器 → 所有探针同时失联，也是信号之一
+
+PROBES = {}  # name → {"t": ts, "ip": tested_ip, "results": {port: bool}, "src": remote_ip}
+PROBE_SERVER = None
+_PARTIAL_NOTIFIED = {}  # name → 上次通知时间，避免反复提醒
+
+
+def probe_status(name, now=None):
+    now = now or time.time()
+    p = PROBES.get(name)
+    if not p or now - p["t"] > CFG.probe_stale:
+        return "offline"
+    res = p["results"]
+    if not res:
+        return "offline"
+    ok = sum(1 for v in res.values() if v)
+    return "ok" if ok == len(res) else ("fail" if ok == 0 else "mixed")
+
+
+def probe_verdict():
+    """
+    综合所有探针：
+      skip    未启用
+      grace   刚换过 IP，探针还在用旧 IP/旧 DNS，不采信
+      silent  所有探针都失联（被墙时探针连不上本机，或探针都掉线了）
+      blocked 在线探针全部连不上节点端口
+      partial 部分探针连不上（线路问题，不换 IP）
+      ok      正常
+    """
+    if not CFG.probes_enabled:
+        return {"state": "skip", "per": {}, "detail": "未启用"}
+    now = time.time()
+    names = list(dict.fromkeys(CFG.probe_names + list(PROBES.keys())))
+    per = {n: probe_status(n, now) for n in names}
+    if now - ST.last_change < CFG.probe_grace:
+        left = int((CFG.probe_grace - (now - ST.last_change)) // 60) + 1
+        return {"state": "grace", "per": per, "detail": f"刚换 IP，{left} 分钟后开始采信"}
+    online = {n: st for n, st in per.items() if st != "offline"}
+    if not names:
+        return {"state": "silent", "per": per, "detail": "尚无探针上报"}
+    if not online:
+        return {"state": "silent", "per": per, "detail": "全部失联"}
+    bad = [n for n, st in online.items() if st == "fail"]
+    if bad and len(bad) == len(online):
+        return {"state": "blocked", "per": per, "detail": "、".join(bad) + " 均连不上节点端口"}
+    if bad:
+        return {"state": "partial", "per": per, "detail": "、".join(bad) + " 连不上，其余正常"}
+    mixed = [n for n, st in online.items() if st == "mixed"]
+    if mixed:
+        return {"state": "partial", "per": per, "detail": "、".join(mixed) + " 部分端口不通"}
+    return {"state": "ok", "per": per, "detail": "正常"}
+
+
+def _probe_text(pv):
+    icon = {"ok": "✅", "fail": "❌", "mixed": "⚠️", "offline": "⚪"}
+    parts = [f"{n} {icon[st]}" + (" 离线" if st == "offline" else "") for n, st in pv["per"].items()]
+    if not parts:
+        parts = ["等待上报"]
+    s = " · ".join(parts)
+    if pv["state"] == "grace":
+        s += f"（{pv['detail']}）"
+    return s
+
+
+def probe_detail_text():
+    pv = probe_verdict()
+    rows = ["<b>🏠 家庭探针</b>", ""]
+    if not CFG.probes_enabled:
+        rows.append("未启用。在服务器运行 <code>pqs-guard probe</code> 开启。")
+        return "\n".join(rows)
+    rows.append(f"节点端口：<code>{', '.join(map(str, CFG.node_ports))}</code>")
+    rows.append(f"综合判定：{html.escape(pv['detail'])}")
+    rows.append("")
+    now = time.time()
+    for name, st in pv["per"].items():
+        p = PROBES.get(name)
+        if not p:
+            rows.append(f"⚪ <b>{html.escape(name)}</b>　从未上报")
+            continue
+        ago = int(now - p["t"])
+        ago_s = f"{ago}s 前" if ago < 120 else f"{ago // 60} 分钟前"
+        icon = {"ok": "✅", "fail": "❌", "mixed": "⚠️", "offline": "⚪"}[st]
+        ports = " ".join(f"{k}{'✓' if v else '✗'}" for k, v in sorted(p["results"].items()))
+        rows.append(f"{icon} <b>{html.escape(name)}</b>　{ago_s}　测 <code>{p['ip']}</code>\n"
+                    f"　　{html.escape(ports)}　来自 {p['src']}")
+    rows.append("")
+    rows.append(f"<i>超过 {CFG.probe_stale // 60} 分钟没上报算离线；换 IP 后 {CFG.probe_grace // 60} 分钟内不采信</i>")
+    return "\n".join(rows)
+
+
+def _parse_qs(qs):
+    from urllib.parse import parse_qsl
+    return dict(parse_qsl(qs, keep_blank_values=True))
+
+
+def _http_resp(status, body):
+    b = body.encode()
+    return (f"HTTP/1.1 {status}\r\nContent-Type: text/plain; charset=utf-8\r\n"
+            f"Content-Length: {len(b)}\r\nConnection: close\r\n\r\n").encode() + b
+
+
+async def _probe_http(reader, writer):
+    src = writer.get_extra_info("peername")[0]
+    try:
+        head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 10)
+        if len(head) > 8192:
+            raise ValueError("header too large")
+        lines = head.decode(errors="replace").split("\r\n")
+        method, target, _ = lines[0].split(" ", 2)
+        length = 0
+        for ln in lines[1:]:
+            if ln.lower().startswith("content-length:"):
+                length = min(int(ln.split(":", 1)[1].strip()), 4096)
+        body = (await asyncio.wait_for(reader.readexactly(length), 10)).decode(errors="replace") if length else ""
+        path, _, qs = target.partition("?")
+        params = _parse_qs(qs)
+        params.update(_parse_qs(body))
+
+        if params.get("key") != CFG.probe_key:
+            resp = _http_resp("403 Forbidden", "bad key")
+        elif method == "GET" and path == "/targets":
+            ip = (LAST or {}).get("r", {}).get("ip") or await get_public_ip() or ""
+            resp = _http_resp("200 OK", f"{ip} {' '.join(map(str, CFG.node_ports))}\n")
+        elif method == "POST" and path == "/report":
+            name = params.get("name", "").strip()[:32]
+            results = {}
+            for item in params.get("r", "").split(","):
+                port, _, val = item.partition(":")
+                if port.strip().isdigit():
+                    results[int(port)] = val.strip() == "ok"
+            if not name or not results:
+                resp = _http_resp("400 Bad Request", "need name and r")
+            else:
+                PROBES[name] = {"t": time.time(), "ip": params.get("ip", "?")[:45],
+                                "results": results, "src": src}
+                log.info("探针 %s(%s) 上报: %s", name, src, results)
+                resp = _http_resp("200 OK", "ok\n")
+        else:
+            resp = _http_resp("404 Not Found", "not found")
+        writer.write(resp)
+        await writer.drain()
+    except Exception as e:
+        log.debug("探针请求异常 %s: %s", src, e)
+    finally:
+        writer.close()
+
+
+async def start_probe_server():
+    global PROBE_SERVER
+    if not CFG.probes_enabled:
+        return
+    PROBE_SERVER = await asyncio.start_server(_probe_http, "0.0.0.0", CFG.probe_port)
+    log.info("探针接收端口已开启: %d", CFG.probe_port)
+
+
 # ───────────────────────────── 换 IP ─────────────────────────────
 
 async def notify(app, text, chat_id=None, markup=None):
@@ -573,12 +752,13 @@ async def change_ip(app, reason, manual=False):
 
 async def monitor_loop(app):
     await asyncio.sleep(20)
-    fails = {"gfw": 0, "nf": 0}
+    fails = {"gfw": 0, "nf": 0, "probe": 0}
     limit_warned = ""
     while True:
         try:
             r = await run_checks()
             g, n = r["gfw"], r["nf"]
+            pv = probe_verdict()
             if g["state"] == "blocked":
                 fails["gfw"] += 1
             elif g["state"] == "ok":
@@ -587,11 +767,28 @@ async def monitor_loop(app):
                 fails["nf"] += 1
             elif n.get("ok") is True:
                 fails["nf"] = 0
-            log.info("检测 ip=%s gfw=%s nf=%s fails=%s", r["ip"], g["state"], n["state"], fails)
+            # 探针：服务器自身网络异常（国外也不通）时不采信失联
+            if pv["state"] == "blocked" or (pv["state"] == "silent" and g["state"] != "unknown"):
+                fails["probe"] += 1
+            elif pv["state"] in ("ok", "partial", "skip"):
+                fails["probe"] = 0
+            log.info("检测 ip=%s gfw=%s nf=%s probe=%s fails=%s",
+                     r["ip"], g["state"], n["state"], pv["state"], fails)
+
+            if pv["state"] == "partial":
+                key = pv["detail"]
+                if time.time() - _PARTIAL_NOTIFIED.get(key, 0) > 3600:
+                    _PARTIAL_NOTIFIED[key] = time.time()
+                    await notify(app, f"⚠️ <b>线路提醒</b>（不换 IP）\n{html.escape(key)}\n"
+                                      f"只有部分地区连不上，通常是运营商线路问题，不是被墙。",
+                                 markup=panel_kb())
 
             reason = None
             if fails["gfw"] >= CFG.fail_threshold:
                 reason = f"IP 被墙（连续 {fails['gfw']} 次国内不可达）"
+            elif fails["probe"] >= CFG.fail_threshold:
+                reason = (f"家庭探针{pv['detail']}（连续 {fails['probe']} 次）" if pv["state"] == "silent"
+                          else f"国内连不上节点端口：{pv['detail']}（连续 {fails['probe']} 次）")
             elif fails["nf"] >= CFG.fail_threshold:
                 reason = f"Netflix 不达标：{n['detail']}"
 
@@ -599,7 +796,7 @@ async def monitor_loop(app):
                 if not ST.auto:
                     await notify(app, f"⚠️ 检测异常但自动换 IP 已关闭\n{html.escape(reason)}\n\n"
                                       f"{fmt_report(r)}", markup=panel_kb())
-                    fails = {"gfw": 0, "nf": 0}  # 避免每轮都提醒
+                    fails = {"gfw": 0, "nf": 0, "probe": 0}  # 避免每轮都提醒
                 elif ST.today_count("auto") >= CFG.max_per_day:
                     today = dt.date.today().isoformat()
                     if limit_warned != today:
@@ -608,7 +805,7 @@ async def monitor_loop(app):
                                           f"{html.escape(reason)}", markup=panel_kb())
                 else:
                     await change_ip(app, reason)
-                    fails = {"gfw": 0, "nf": 0}
+                    fails = {"gfw": 0, "nf": 0, "probe": 0}
         except Exception:
             log.exception("监控循环异常")
         try:
@@ -660,6 +857,7 @@ def settings_kb():
     on = lambda b: "开" if b else "关"  # noqa: E731
     return InlineKeyboardMarkup([
         [B("🌐 同步 DDNS", callback_data="ddns"), B("📜 换 IP 记录", callback_data="history")],
+    ] + ([[B("🏠 探针状态", callback_data="probes")]] if CFG.probes_enabled else []) + [
         [B(f"🧱 被墙检测：{on(CFG.check_gfw)}", callback_data="s:check_gfw"),
          B(f"🎬 Netflix 检测：{on(CFG.check_netflix)}", callback_data="s:check_netflix")],
         [B(f"🎯 Netflix 要求：{'全解锁' if CFG.nf_require == 'full' else '仅自制剧'}",
@@ -692,7 +890,9 @@ HELP_TEXT = (
     "🔍 <b>检测</b>：查看当前 IP、是否被墙、Netflix 解锁情况\n"
     "🔄 <b>换 IP</b>：手动换 IP，完成后自动同步 DDNS 并复检\n"
     "🤖 <b>自动</b>：被墙或 Netflix 不达标时自动换 IP，点击开关\n"
-    "⚙️ <b>更多</b>：同步 DDNS、换 IP 记录、各项设置\n\n"
+    "⚙️ <b>更多</b>：同步 DDNS、换 IP 记录、探针状态、各项设置\n\n"
+    "🏠 <b>探针</b>：你家里设备定时连节点端口并上报，能发现只封端口和线路问题。"
+    "全部探针连不上才算被墙；只有一地连不上只提醒不换 IP。\n\n"
     "<b>被墙判定</b>：国外能通，但国内目标全部连不上，且连续多次。"
     "「国内 3/4 可达」表示 4 个国内目标连上 3 个，只要有 1 个能连就是正常。\n\n"
     f"底部「{PANEL_BTN}」按钮随时打开本面板。"
@@ -848,6 +1048,8 @@ async def on_button(update: Update, ctx):
         await safe_edit(q, await do_ddns(), back_kb("settings"))
     elif d == "history":
         await safe_edit(q, history_text(), back_kb("settings"))
+    elif d == "probes":
+        await safe_edit(q, probe_detail_text(), back_kb("settings"))
     elif d == "help":
         await safe_edit(q, HELP_TEXT, back_kb("settings"))
     elif d == "settings":
@@ -882,6 +1084,7 @@ async def post_init(app: Application):
         BotCommand("settings", "⚙️ 设置"),
     ])
     app.bot_data["monitor"] = asyncio.create_task(monitor_loop(app))
+    await start_probe_server()
     await run_checks()
     await notify(app, f"🚀 <b>守护已启动</b> v{__version__}\n\n{panel_text()}", markup=panel_kb())
 
@@ -890,6 +1093,8 @@ async def post_shutdown(app: Application):
     t = app.bot_data.get("monitor")
     if t:
         t.cancel()
+    if PROBE_SERVER:
+        PROBE_SERVER.close()
 
 
 def register_handlers(app: Application):

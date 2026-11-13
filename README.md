@@ -10,6 +10,7 @@ PQS 服务器的 IP 守护程序，可以用 Telegram 机器人控制：
 | Netflix 自动换 IP | 看不了非自制剧（或可设为只要求自制剧），连续 2 次才换 |
 | 换 IP 后自动处理 | 等新 IP 生效 → 更新 DDNS（Cloudflare / 自定义 URL）→ 确认 DNS 已生效 → 再检测一次 → 推送结果 |
 | 防止换个不停 | 冷却 10 分钟、每天自动换 IP 默认最多 8 次（可在面板里改）、同一时间只跑一个换 IP 任务 |
+| 家庭探针 | 国内设备定时连节点端口并上报，能发现「只封端口」和线路问题；全部探针连不上才换 IP，只有一地连不上只提醒 |
 | 控制面板 | 主面板 4 个按钮：检测、换 IP、自动开关、更多。「更多」里有同步 DDNS、换 IP 记录和各项设置，点一下就生效 |
 
 ## 一键安装
@@ -149,6 +150,46 @@ Cloudflare 那边通常几秒内就生效了，换 IP 完成的通知里会显�
 - 电脑上可以把 DNS 换成 `1.1.1.1` / `8.8.8.8`。Mac 还可以运行 `sudo dscacheutil -flushcache; sudo killall -HUP mDNSResponder` 清掉本机缓存
 
 这是 DNS 缓存的特性，程序没办法彻底解决。所以自动换 IP 只在真正被墙或 Netflix 不达标时才会触发。
+
+## 家庭探针
+
+服务器自己只能从台湾往国内测，发现不了「只封了节点端口」和「某地线路不通」。探针反过来：放在你国内常开的设备上（unraid / NAS / 路由器 / 电脑），每 3 分钟从家里连一次节点端口，把结果报给 pqs-guard。
+
+判定规则：
+
+| 探针结果 | 处理 |
+|---|---|
+| 全部探针都连不上节点端口 | 算被墙，连续 2 次后自动换 IP |
+| 全部探针同时失联（连服务器都连不上） | 同上（服务器自身断网时不算） |
+| 只有部分地区连不上 | 只推送「线路提醒」，不换 IP |
+| 刚换过 IP 的 20 分钟内 | 不采信（家里 DNS 还缓存着旧 IP） |
+
+### 服务器端开启
+
+```bash
+pqs-guard probe
+```
+
+按提示填节点端口（会自动检测 x-ui 的监听端口）、探针名称（如 `浙江,天津`）、上报端口（默认 58080，脚本会自动放行防火墙）。结束时会打印每个探针的安装命令。
+
+### 探针端（以 unraid 为例）
+
+1. 打开 unraid 终端，下载脚本到 flash 盘（重启不丢）：
+   ```bash
+   curl -fsSL https://raw.githubusercontent.com/wwintj/pqs-guard/main/probe.sh -o /boot/config/pqs-probe.sh && chmod +x /boot/config/pqs-probe.sh
+   ```
+2. 先手动跑一次服务器打印的命令，应看到「已上报」：
+   ```bash
+   bash /boot/config/pqs-probe.sh 浙江 tw.example.com 58080 密钥
+   ```
+3. 让它每 3 分钟跑一次：安装 **User Scripts** 插件（Apps 里搜），新建脚本，内容就是上面那行；Schedule 选 **Custom**，填 `*/3 * * * *`。
+   也可以不用 cron，改成常驻：在命令末尾加 `--loop`，用 User Scripts 的 **At First Array Start Only** 运行，并勾选 Run in Background。
+
+其他设备：OpenWrt / 群晖 / Linux 用 cron 同样的命令；只需要 `bash` 和 `curl`。
+
+### 查看
+
+Telegram 面板会多一行 `🏠 探针　浙江 ✅ · 天津 ✅`；⚙️ 更多 → 🏠 探针状态 能看到每个探针的上报时间、每个端口的结果和来源 IP。超过 10 分钟没上报显示「离线」。
 
 ## 检测原理与局限
 

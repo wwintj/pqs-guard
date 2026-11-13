@@ -337,6 +337,101 @@ do_config() {
   start_service
 }
 
+detect_node_ports() {  # 从 xray / x-ui 等进程的监听端口猜节点端口
+  ss -lntpH 2>/dev/null | grep -Ei 'xray|v2ray|sing-box|hysteria|x-ui' \
+    | awk '{print $4}' | sed 's/.*://' | grep -E '^[0-9]+$' | sort -un | tr '\n' ',' | sed 's/,$//'
+}
+
+open_firewall() {  # open_firewall 端口
+  if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q '^Status: active'; then
+    ufw allow "$1"/tcp >/dev/null && green "✓ ufw 已放行 $1/tcp"
+  elif command -v firewall-cmd >/dev/null && firewall-cmd --state >/dev/null 2>&1; then
+    firewall-cmd --permanent --add-port="$1"/tcp >/dev/null && firewall-cmd --reload >/dev/null && green "✓ firewalld 已放行 $1/tcp"
+  elif iptables -S INPUT 2>/dev/null | grep -q -- '-P INPUT DROP'; then
+    iptables -C INPUT -p tcp --dport "$1" -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport "$1" -j ACCEPT
+    yellow "已用 iptables 放行 $1/tcp（重启后可能失效，请按你的防火墙方式持久化）"
+  else
+    info "未检测到防火墙，端口 $1 应可直接访问"
+  fi
+}
+
+do_probe() {
+  need_root; [ -f "$CONF" ] || die "配置文件不存在，请先安装"
+  local cur_port cur_key cur_names cur_ports v
+  cur_port=$(grep '^PROBE_PORT=' "$CONF" | cut -d= -f2-); cur_port=${cur_port:-0}
+  cur_key=$(grep '^PROBE_KEY=' "$CONF" | cut -d= -f2-)
+  cur_names=$(grep '^PROBE_NAMES=' "$CONF" | cut -d= -f2-)
+  cur_ports=$(grep '^NODE_PORTS=' "$CONF" | cut -d= -f2-)
+
+  echo
+  echo "================ 家庭探针 ================"
+  echo "探针放在你国内常开的设备上，定时连接本机的节点端口并上报，"
+  echo "能发现「只封端口」和线路问题；全部探针连不上才判定被墙。"
+  echo
+  if [ "$cur_port" != 0 ]; then
+    echo " 当前：端口 $cur_port，探针 ${cur_names:-无}，节点端口 ${cur_ports:-无}"
+    echo "  1) 显示探针安装命令"
+    echo "  2) 重新配置"
+    echo "  3) 关闭探针功能"
+    echo "  0) 返回"
+    ask v "请选择" 1
+    case "$v" in
+      1) show_probe_install "$cur_port" "$cur_key" "$cur_names"; return ;;
+      2) ;;
+      3) set_conf PROBE_PORT 0; start_service; green "探针功能已关闭"; return ;;
+      *) return ;;
+    esac
+  fi
+
+  local detected; detected=$(detect_node_ports)
+  [ -n "$detected" ] && info "检测到可能的节点端口: $detected"
+  while :; do
+    ask v "要探测的节点端口（x-ui 入站端口，多个用逗号分隔）" "${cur_ports:-$detected}"
+    [[ "$v" =~ ^[0-9]+(,[0-9]+)*$ ]] && break
+    red "格式不对，例如 443 或 443,8443"
+  done
+  set_conf NODE_PORTS "$v"
+
+  ask v "探针名称，用逗号分隔（如 浙江,天津）" "${cur_names:-浙江,天津}"
+  set_conf PROBE_NAMES "$v"; cur_names=$v
+
+  ask v "探针上报端口（本机需开放此 TCP 端口）" "$([ "$cur_port" != 0 ] && echo "$cur_port" || echo 58080)"
+  [[ "$v" =~ ^[0-9]+$ ]] || die "端口必须是数字"
+  set_conf PROBE_PORT "$v"; cur_port=$v
+
+  if [ -z "$cur_key" ]; then
+    cur_key=$(tr -dc 'a-z0-9' < /dev/urandom | head -c 24)
+    set_conf PROBE_KEY "$cur_key"
+  fi
+
+  open_firewall "$cur_port"
+  start_service
+  show_probe_install "$cur_port" "$cur_key" "$cur_names"
+}
+
+show_probe_install() {  # show_probe_install 端口 密钥 名称列表
+  local port=$1 key=$2 names=$3 host name
+  host=$(grep '^CF_RECORD_NAME=' "$CONF" | cut -d= -f2-)
+  [ -n "$host" ] && [ "$(grep '^DDNS_MODE=' "$CONF" | cut -d= -f2-)" = cloudflare ] || host=$(curl -fsS -m 8 https://api.ipify.org 2>/dev/null)
+  echo
+  echo "================ 探针安装（在你家里的设备上执行）================"
+  echo "1) 下载探针脚本（任选一处保存；unraid 推荐 /boot/config/ 目录，重启不丢）："
+  echo
+  echo "   curl -fsSL $RAW/probe.sh -o /boot/config/pqs-probe.sh && chmod +x /boot/config/pqs-probe.sh"
+  echo
+  echo "2) 每台设备按所在地用对应命令，每 3 分钟运行一次（cron / unraid User Scripts），"
+  echo "   或加 --loop 常驻运行："
+  echo
+  IFS=',' read -ra arr <<< "$names"
+  for name in "${arr[@]}"; do
+    echo "   [$name]  bash /boot/config/pqs-probe.sh $name $host $port $key"
+  done
+  echo
+  echo "3) 先手动跑一次看输出，应显示「已上报」。然后在 Telegram：⚙️ 更多 → 🏠 探针状态 查看。"
+  echo "   详细步骤见 https://github.com/${REPO}#家庭探针"
+  echo "================================================================="
+}
+
 do_status() { systemctl --no-pager status pqs-guard | head -n 12 || true; }
 do_log()    { journalctl -u pqs-guard -n 100 -f; }
 do_check()  { need_root; is_installed || die "尚未安装"; self_check; }
@@ -358,11 +453,12 @@ menu() {
   echo "  6) 查看日志"
   echo "  7) 重启"
   echo "  8) 立即检测一次（不换 IP）"
+  echo "  9) 家庭探针设置"
   echo "  0) 退出"
   local c; ask c "请选择" 0
   case "$c" in
     1) do_install ;; 2) do_upgrade ;; 3) do_uninstall ;; 4) do_config ;;
-    5) do_status ;; 6) do_log ;; 7) need_root; start_service ;; 8) do_check ;;
+    5) do_status ;; 6) do_log ;; 7) need_root; start_service ;; 8) do_check ;; 9) do_probe ;;
     *) exit 0 ;;
   esac
 }
@@ -376,6 +472,7 @@ case "${1:-}" in
   log|logs)  do_log ;;
   restart)   need_root; start_service ;;
   check)     do_check ;;
+  probe)     do_probe ;;
   "")        menu ;;
-  *) echo "用法: pqs-guard [install|upgrade|uninstall|config|status|log|restart|check]"; exit 1 ;;
+  *) echo "用法: pqs-guard [install|upgrade|uninstall|config|probe|status|log|restart|check]"; exit 1 ;;
 esac
