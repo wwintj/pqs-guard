@@ -5,13 +5,14 @@
 # 用法（四个参数依次是：探针名 服务器域名 探针端口 密钥，都在服务器上运行 pqs-guard probe 时给出）：
 #   bash pqs-probe.sh 浙江 tw.example.com 58080 密钥          # 跑一次（配合 cron，每 3 分钟）
 #   bash pqs-probe.sh 浙江 tw.example.com 58080 密钥 --loop   # 常驻循环，每 3 分钟一次
+# 也可以用环境变量 PROBE_NAME / PROBE_SERVER / PROBE_PORT / PROBE_KEY / PROBE_LOOP=1 代替参数（Docker 方式）。
 # 只依赖 bash 和 curl。
 
 NAME="${1:-${PROBE_NAME:-}}"
 SERVER="${2:-${PROBE_SERVER:-}}"
 PORT="${3:-${PROBE_PORT:-58080}}"
 KEY="${4:-${PROBE_KEY:-}}"
-LOOP=0; [ "${5:-}" = "--loop" ] && LOOP=1
+LOOP="${PROBE_LOOP:-0}"; [ "${5:-}" = "--loop" ] && LOOP=1
 INTERVAL="${PROBE_INTERVAL:-180}"
 CACHE="${PROBE_CACHE:-/tmp/pqs-probe-$(printf '%s' "$NAME" | { md5sum 2>/dev/null || md5 2>/dev/null; } | cut -c1-8).cache}"
 

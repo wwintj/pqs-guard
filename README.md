@@ -172,9 +172,24 @@ pqs-guard probe
 
 按提示填节点端口（会自动检测 x-ui 的监听端口）、探针名称（如 `浙江,天津`）、上报端口（默认 58080，脚本会自动放行防火墙）。结束时会打印每个探针的安装命令。
 
-### 探针端（以 unraid 为例）
+### 探针端：Docker 方式（unraid 推荐）
 
-1. 打开 unraid 终端，下载脚本到 flash 盘（重启不丢）：
+镜像 `ghcr.io/wwintj/pqs-guard/probe`只有几 MB，常驻循环、开机自启。在 unraid 终端里执行服务器打印出的那条命令即可，形如：
+
+```bash
+docker run -d --name pqs-probe-1 --restart unless-stopped \
+  -e PROBE_NAME=浙江 -e PROBE_SERVER=tw.example.com -e PROBE_PORT=58080 -e PROBE_KEY=密钥 \
+  ghcr.io/wwintj/pqs-guard/probe:latest
+```
+
+- 看日志：`docker logs -f pqs-probe-1`，每 3 分钟一行「已上报」
+- 之后它会出现在 unraid 的 Docker 页里，可以像其他容器一样启停
+- 不想敲命令也可以在 Docker 页点 **Add Container**：Repository 填 `ghcr.io/wwintj/pqs-guard/probe:latest`，Network Type 选 bridge，再用 **Add another Path, Port, Variable** 加 4 个 Variable：`PROBE_NAME`、`PROBE_SERVER`、`PROBE_PORT`、`PROBE_KEY`
+- 国内拉 ghcr.io 慢的话，可在 unraid 的 Docker 设置里加镜像加速，或先在能上网的机器上 `docker pull` 再导入
+
+### 探针端：脚本方式（没有 Docker 的设备）
+
+1. 下载脚本（unraid 放 flash 盘 `/boot/config/`，重启不丢）：
    ```bash
    curl -fsSL https://raw.githubusercontent.com/wwintj/pqs-guard/main/probe.sh -o /boot/config/pqs-probe.sh && chmod +x /boot/config/pqs-probe.sh
    ```
@@ -186,6 +201,7 @@ pqs-guard probe
    也可以不用 cron，改成常驻：在命令末尾加 `--loop`，用 User Scripts 的 **At First Array Start Only** 运行，并勾选 Run in Background。
 
 其他设备：OpenWrt / 群晖 / Linux 用 cron 同样的命令；只需要 `bash` 和 `curl`。
+脚本也接受环境变量 `PROBE_NAME` / `PROBE_SERVER` / `PROBE_PORT` / `PROBE_KEY` / `PROBE_LOOP=1`，Docker 镜像就是这样用的。
 
 ### 查看
 

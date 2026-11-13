@@ -428,6 +428,17 @@ show_probe_install() {  # show_probe_install 端口 密钥 名称列表
   done
   echo
   echo "3) 先手动跑一次看输出，应显示「已上报」。然后在 Telegram：⚙️ 更多 → 🏠 探针状态 查看。"
+  echo
+  echo "---- 或者用 Docker（unraid 推荐，开机自启、自动重连）----"
+  local i=0
+  for name in "${arr[@]}"; do
+    i=$((i+1))
+    echo "   [$name]  docker run -d --name pqs-probe-$i --restart unless-stopped \\"
+    echo "             -e PROBE_NAME=$name -e PROBE_SERVER=$host -e PROBE_PORT=$port -e PROBE_KEY=$key \\"
+    echo "             ghcr.io/${REPO}/probe:latest"
+  done
+  echo "   看日志: docker logs -f pqs-probe-1"
+  echo
   echo "   详细步骤见 https://github.com/${REPO}#家庭探针"
   echo "================================================================="
 }
